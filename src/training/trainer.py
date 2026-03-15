@@ -44,8 +44,8 @@ class Trainer:
             for batch in tqdm(self.train_loader):
 
                 x, y = batch
-                x = x.to(self.device)
-                y = y.to(self.device)
+                x = x.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
 
                 with torch.cuda.amp.autocast(enabled=config.mixed_precision):
 

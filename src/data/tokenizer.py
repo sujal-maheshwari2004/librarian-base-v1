@@ -9,7 +9,7 @@ from tqdm import tqdm
 # ------------------------------------------------
 # Config
 # ------------------------------------------------
-TOKENIZER_PATH = Path("../../tokenizer/tokenizer/tokenizer.json")
+TOKENIZER_PATH = Path("tokenizer/tokenizer.json")
 
 CLEANED_DIR = Path("data/cleaned")
 TOKENIZED_DIR = Path("data/tokenized")

@@ -17,7 +17,7 @@ class ModelConfig:
     max_seq_len: int = 512
 
     # dropout
-    dropout: float = 0.0
+    dropout: float = 0.1
 
     # rope
     rope_theta: float = 10000.0
