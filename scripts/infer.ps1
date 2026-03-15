@@ -12,30 +12,24 @@ $choice = Read-Host "Enter choice (1 or 2)"
 
 if ($choice -eq "1") {
 
-```
-Write-Host ""
-Write-Host "Starting chat mode..." -ForegroundColor Green
-python scripts/run_chat.py
-```
+    Write-Host ""
+    Write-Host "Starting chat mode..." -ForegroundColor Green
+    python scripts/run_chat.py
 
 }
 elseif ($choice -eq "2") {
 
-```
-Write-Host ""
-$prompt = Read-Host "Enter prompt"
+    Write-Host ""
+    $prompt = Read-Host "Enter prompt"
 
-Write-Host ""
-Write-Host "Running inference..." -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Running inference..." -ForegroundColor Green
 
-python scripts/run_infer.py --prompt "$prompt"
-```
+    python scripts/run_infer.py --prompt "$prompt"
 
 }
 else {
 
-```
-Write-Host "Invalid choice." -ForegroundColor Red
-```
+    Write-Host "Invalid choice." -ForegroundColor Red
 
 }

@@ -12,8 +12,8 @@ torch.backends.cudnn.allow_tf32 = True
 
 def main():
 
-    model_config = load_model_config("configs/model.json")
-    train_config = load_train_config("configs/train.json")
+    model_config = load_model_config("configs/model_dummy.json")
+    train_config = load_train_config("configs/train_dummy.json")
 
     model = GPT(model_config)
 

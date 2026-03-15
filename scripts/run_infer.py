@@ -1,3 +1,9 @@
+import sys
+import os
+
+# Add project root to PYTHONPATH
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 import argparse
 import torch
 
@@ -20,7 +26,7 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model_config = load_model_config("configs/model.json")
+    model_config = load_model_config("configs/model_dummy.json")
 
     tokenizer = Tokenizer.from_file("tokenizer/tokenizer.json")
 

@@ -54,3 +54,28 @@ Write-Host ""
 Write-Host "=================================" -ForegroundColor Cyan
 Write-Host " Training Pipeline Complete"
 Write-Host "=================================" -ForegroundColor Cyan
+
+
+# ---------------------------------
+# Step 7 — Evaluate best checkpoint
+# ---------------------------------
+Write-Host ""
+Write-Host "Step 7: Evaluate best model" -ForegroundColor Yellow
+
+$best_ckpt = Get-ChildItem checkpoints/best/*.pt |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+if ($best_ckpt) {
+
+    Write-Host "Best checkpoint found: $($best_ckpt.FullName)"
+
+    python -m src.evaluation.eval_runner `
+        --checkpoint $best_ckpt.FullName
+
+}
+else {
+
+    Write-Host "No checkpoint found." -ForegroundColor Red
+
+}

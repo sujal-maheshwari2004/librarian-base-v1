@@ -1,5 +1,6 @@
 import time
 import torch
+import requests
 from tqdm import tqdm
 
 
@@ -19,11 +20,21 @@ class TrainingLogger:
         self.last_time = time.time()
         self.tokens_seen = 0
 
+        # Unique run identifier
+        self.run_id = int(time.time())
+
+        # API endpoint
+        self.api_endpoint = "https://librarian-logging-api-point.onrender.com/train_metrics"
+
         tqdm.write("────────────────────────────────────────")
         tqdm.write("RUN START")
+        tqdm.write(f"run_id: {self.run_id}")
         tqdm.write(f"seq_len: {seq_len} | batch: {batch_size}")
         tqdm.write("────────────────────────────────────────")
 
+    # ------------------------------------------------
+    # Throughput calculation
+    # ------------------------------------------------
     def throughput(self):
 
         now = time.time()
@@ -38,6 +49,9 @@ class TrainingLogger:
 
         return int(tokens / elapsed)
 
+    # ------------------------------------------------
+    # GPU Memory
+    # ------------------------------------------------
     def gpu_mem(self):
 
         if torch.cuda.is_available():
@@ -45,10 +59,44 @@ class TrainingLogger:
 
         return 0
 
+    # ------------------------------------------------
+    # Send metrics to API
+    # ------------------------------------------------
+    def send_metrics(self, payload):
+
+        try:
+
+            requests.post(
+                self.api_endpoint,
+                json=payload,
+                timeout=0.5
+            )
+
+        except Exception:
+            # Never interrupt training if API fails
+            pass
+
+    # ------------------------------------------------
+    # Train logging
+    # ------------------------------------------------
     def train(self, step, loss, lr, grad):
 
         tok_s = self.throughput()
         gpu = self.gpu_mem()
+
+        payload = {
+            "run_id": self.run_id,
+            "type": "train",
+            "step": step,
+            "loss": float(loss),
+            "lr": float(lr),
+            "grad_norm": float(grad),
+            "tokens_per_sec": tok_s,
+            "gpu_mem_gb": gpu,
+            "timestamp": time.time()
+        }
+
+        self.send_metrics(payload)
 
         tqdm.write(
             f"{GREEN}TRAIN{RESET} "
@@ -60,7 +108,20 @@ class TrainingLogger:
             f"gpu {gpu:4.2f}GB"
         )
 
+    # ------------------------------------------------
+    # Eval logging
+    # ------------------------------------------------
     def eval(self, step, val_loss):
+
+        payload = {
+            "run_id": self.run_id,
+            "type": "eval",
+            "step": step,
+            "val_loss": float(val_loss),
+            "timestamp": time.time()
+        }
+
+        self.send_metrics(payload)
 
         tqdm.write(
             f"{BLUE}EVAL {RESET} "
@@ -68,7 +129,20 @@ class TrainingLogger:
             f"val_loss {val_loss:6.4f}"
         )
 
+    # ------------------------------------------------
+    # Checkpoint logging
+    # ------------------------------------------------
     def checkpoint(self, step, val_loss):
+
+        payload = {
+            "run_id": self.run_id,
+            "type": "checkpoint",
+            "step": step,
+            "val_loss": float(val_loss),
+            "timestamp": time.time()
+        }
+
+        self.send_metrics(payload)
 
         tqdm.write(
             f"{YELLOW}CKPT {RESET} "

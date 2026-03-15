@@ -43,7 +43,7 @@ def main():
     # Load model config
     # ------------------------------------------------
 
-    model_config = load_model_config("configs/model.json")
+    model_config = load_model_config("configs/model_dummy.json")
 
     # ------------------------------------------------
     # Build model
