@@ -43,9 +43,12 @@ class Trainer:
             leave=True
         )
 
+    # ------------------------------------------------
+    # Gradient Norm
+    # ------------------------------------------------
     def grad_norm(self):
 
-        total_norm = 0
+        total_norm = 0.0
 
         for p in self.model.parameters():
 
@@ -57,6 +60,9 @@ class Trainer:
 
         return total_norm ** 0.5
 
+    # ------------------------------------------------
+    # Training Loop
+    # ------------------------------------------------
     def train(self):
 
         model = self.model
@@ -70,6 +76,8 @@ class Trainer:
 
         model.train()
 
+        grad_norm = 0.0
+
         while self.step < config.total_steps:
 
             for batch in self.train_loader:
@@ -79,6 +87,9 @@ class Trainer:
                 x = x.to(self.device, non_blocking=True)
                 y = y.to(self.device, non_blocking=True)
 
+                # ---------------------------
+                # Forward
+                # ---------------------------
                 with torch.amp.autocast(
                     "cuda",
                     enabled=config.mixed_precision
@@ -91,10 +102,17 @@ class Trainer:
                         y.reshape(-1)
                     )
 
+                    # gradient accumulation scaling
                     loss = loss / config.grad_accum
 
+                # ---------------------------
+                # Backward
+                # ---------------------------
                 scaler.scale(loss).backward()
 
+                # ---------------------------
+                # Optimizer Step
+                # ---------------------------
                 if (self.step + 1) % config.grad_accum == 0:
 
                     scaler.unscale_(optimizer)
@@ -109,12 +127,15 @@ class Trainer:
 
                     optimizer.zero_grad(set_to_none=True)
 
+                    # learning rate scheduler
                     lr_mult = cosine_lr(self.step, config)
 
                     for g in optimizer.param_groups:
                         g["lr"] = config.lr * lr_mult
 
-                # logging
+                # ---------------------------
+                # Logging
+                # ---------------------------
                 if self.step % 100 == 0:
 
                     lr = optimizer.param_groups[0]["lr"]
@@ -126,7 +147,9 @@ class Trainer:
                         grad_norm
                     )
 
-                # evaluation
+                # ---------------------------
+                # Evaluation
+                # ---------------------------
                 if self.step % config.eval_interval == 0 and self.step != 0:
 
                     val_loss = self.evaluate()
@@ -146,6 +169,9 @@ class Trainer:
 
                         self.logger.checkpoint(self.step, val_loss)
 
+                # ---------------------------
+                # Step update
+                # ---------------------------
                 self.step += 1
                 self.progress.update(1)
 
@@ -154,6 +180,9 @@ class Trainer:
 
         self.progress.close()
 
+    # ------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------
     @torch.no_grad()
     def evaluate(self):
 
