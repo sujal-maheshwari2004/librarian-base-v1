@@ -10,7 +10,7 @@ def save_checkpoint(model, optimizer, step, path):
     torch.save(
         {
             "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "optimizer": optimizer.state_dict() if optimizer else None,
             "step": step,
         },
         path
@@ -25,7 +25,7 @@ def save_latest(model, optimizer, step):
     torch.save(
         {
             "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "optimizer": optimizer.state_dict() if optimizer else None,
             "step": step,
         },
         path
@@ -37,6 +37,9 @@ def load_checkpoint(model, optimizer, path):
     ckpt = torch.load(path, map_location="cpu")
 
     model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
 
-    return ckpt["step"]
+    # FIXED: allow optimizer=None
+    if optimizer is not None and ckpt.get("optimizer") is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+
+    return ckpt.get("step", 0)
