@@ -9,8 +9,8 @@ from src.training.trainer import Trainer
 
 def main():
 
-    model_config = load_model_config("configs/model_config.json")
-    train_config = load_train_config("configs/train_config.json")
+    model_config = load_model_config("configs/train.json")
+    train_config = load_train_config("configs/train.json")
 
     model = GPT(model_config)
 

@@ -6,7 +6,7 @@ import statistics
 
 
 TOKENIZER_PATH = Path("tokenizer/tokenizer.json")
-DATA_PATH = Path("../src/data/data/cleaned/merged_train.txt")
+DATA_PATH = Path("data/cleaned/merged_train.txt")
 
 MAX_SAMPLES = 50000  # limit evaluation size for speed
 

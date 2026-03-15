@@ -1,12 +1,10 @@
-# src/data/download.py
-
 from datasets import load_dataset
 from pathlib import Path
 import random
 
 
 def download_datasets(
-    use_fraction: float = 1.0,
+    use_fraction: float = 0.0001,
     seed: int = 42,
     output_dir: str = "data/raw"
 ):

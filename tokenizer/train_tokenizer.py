@@ -15,7 +15,7 @@ import json
 # ------------------------------------------------
 # Configuration
 # ------------------------------------------------
-DATA_FILE = Path("../src/data/data/cleaned/merged_train.txt")
+DATA_FILE = Path("data/cleaned/merged_train.txt")
 TOKENIZER_DIR = Path("tokenizer")
 
 VOCAB_SIZE = 16000
