@@ -15,10 +15,11 @@ class PackedDataset(Dataset):
             mode="r"
         )
 
-        self.num_sequences = len(self.data) // seq_len
+        # FIXED: prevent overflow
+        self.num_sequences = len(self.data) // seq_len - 1
 
     def __len__(self):
-        return self.num_sequences - 1
+        return self.num_sequences
 
     def __getitem__(self, idx):
 
