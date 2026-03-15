@@ -1,0 +1,13 @@
+{
+    "vocab_size": 16000,
+    "model": "BPE",
+    "pre_tokenizer": "ByteLevel",
+    "normalizer": "NFKC",
+    "min_frequency": 2,
+    "special_tokens": [
+        "<pad>",
+        "<bos>",
+        "<eos>",
+        "<unk>"
+    ]
+}

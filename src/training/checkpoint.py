@@ -17,6 +17,21 @@ def save_checkpoint(model, optimizer, step, path):
     )
 
 
+def save_latest(model, optimizer, step):
+
+    path = Path("checkpoints/latest.pt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+        },
+        path
+    )
+
+
 def load_checkpoint(model, optimizer, path):
 
     ckpt = torch.load(path, map_location="cpu")

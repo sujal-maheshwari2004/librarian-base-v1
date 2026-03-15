@@ -4,7 +4,7 @@ import random
 
 
 def download_datasets(
-    use_fraction: float = 0.0001,
+    use_fraction: float = 1.0,
     seed: int = 42,
     output_dir: str = "data/raw"
 ):
@@ -67,4 +67,4 @@ def download_datasets(
 
 
 if __name__ == "__main__":
-    download_datasets(use_fraction=0.1)
+    download_datasets(use_fraction=0.001)

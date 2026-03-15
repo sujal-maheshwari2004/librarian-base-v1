@@ -4,8 +4,10 @@
 __pycache__/
 *.py[cod]
 *.so
-*.txt
+
+# =============================
 # Virtual environments
+# =============================
 .venv/
 venv/
 env/
@@ -39,7 +41,7 @@ runs/
 *.log
 
 # =============================
-# Large binary safety
+# Large binaries
 # =============================
 *.bin
 *.pt

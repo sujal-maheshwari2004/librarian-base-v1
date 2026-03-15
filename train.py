@@ -6,10 +6,13 @@ from src.model.gpt import GPT
 from src.data.dataset import PackedDataset
 from src.training.trainer import Trainer
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 def main():
 
-    model_config = load_model_config("configs/train.json")
+    model_config = load_model_config("configs/model.json")
     train_config = load_train_config("configs/train.json")
 
     model = GPT(model_config)
