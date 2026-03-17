@@ -16,66 +16,51 @@ class Trainer:
         train_loader,
         val_loader,
         train_config,
-        device
+        device,
+        run_id: int | None = None,
     ):
-
-        self.model = model.to(device)
+        self.model        = model.to(device)
         self.train_loader = train_loader
-        self.val_loader = val_loader
-
-        self.config = train_config
-        self.device = device
+        self.val_loader   = val_loader
+        self.config       = train_config
+        self.device       = device
 
         self.optimizer = build_optimizer(model, train_config)
 
-        self.step = 0
+        self.step          = 0
         self.best_val_loss = float("inf")
 
         self.logger = TrainingLogger(
             seq_len=model.config.max_seq_len,
-            batch_size=train_config.batch_size
+            batch_size=train_config.batch_size,
+            run_id=run_id,
         )
 
         self.progress = tqdm(
             total=train_config.total_steps,
             desc="training",
             dynamic_ncols=True,
-            leave=True
+            leave=True,
         )
 
-    # ------------------------------------------------
-    # Gradient Norm
-    # ------------------------------------------------
+    # ── gradient norm ────────────────────────────────────────
     def grad_norm(self):
-
         total_norm = 0.0
-
         for p in self.model.parameters():
-
             if p.grad is None:
                 continue
-
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-
+            total_norm += p.grad.data.norm(2).item() ** 2
         return total_norm ** 0.5
 
-    # ------------------------------------------------
-    # Training Loop
-    # ------------------------------------------------
+    # ── training loop ────────────────────────────────────────
     def train(self):
-
-        model = self.model
+        model     = self.model
         optimizer = self.optimizer
-        config = self.config
+        config    = self.config
 
-        scaler = torch.amp.GradScaler(
-            "cuda",
-            enabled=config.mixed_precision
-        )
+        scaler    = torch.amp.GradScaler("cuda", enabled=config.mixed_precision)
 
         model.train()
-
         grad_norm = 0.0
 
         while self.step < config.total_steps:
@@ -83,95 +68,52 @@ class Trainer:
             for batch in self.train_loader:
 
                 x, y = batch
-
                 x = x.to(self.device, non_blocking=True)
                 y = y.to(self.device, non_blocking=True)
 
-                # ---------------------------
-                # Forward
-                # ---------------------------
-                with torch.amp.autocast(
-                    "cuda",
-                    enabled=config.mixed_precision
-                ):
-
+                # ── forward ─────────────────────────────────
+                with torch.amp.autocast("cuda", enabled=config.mixed_precision):
                     logits = model(x)
-
-                    loss = F.cross_entropy(
+                    loss   = F.cross_entropy(
                         logits.reshape(-1, logits.size(-1)),
-                        y.reshape(-1)
+                        y.reshape(-1),
                     )
-
-                    # gradient accumulation scaling
                     loss = loss / config.grad_accum
 
-                # ---------------------------
-                # Backward
-                # ---------------------------
+                # ── backward ────────────────────────────────
                 scaler.scale(loss).backward()
 
-                # ---------------------------
-                # Optimizer Step
-                # ---------------------------
+                # ── optimizer step ──────────────────────────
                 if (self.step + 1) % config.grad_accum == 0:
-
                     scaler.unscale_(optimizer)
-
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        1.0
-                    )
-
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
-
                     optimizer.zero_grad(set_to_none=True)
 
-                    # learning rate scheduler
                     lr_mult = cosine_lr(self.step, config)
-
                     for g in optimizer.param_groups:
                         g["lr"] = config.lr * lr_mult
 
-                # ---------------------------
-                # Logging
-                # ---------------------------
+                # ── logging ─────────────────────────────────
                 if self.step % 100 == 0:
-
                     lr = optimizer.param_groups[0]["lr"]
+                    self.logger.train(self.step, loss.item(), lr, grad_norm)
 
-                    self.logger.train(
-                        self.step,
-                        loss.item(),
-                        lr,
-                        grad_norm
-                    )
-
-                # ---------------------------
-                # Evaluation
-                # ---------------------------
+                # ── evaluation ──────────────────────────────
                 if self.step % config.eval_interval == 0 and self.step != 0:
-
                     val_loss = self.evaluate()
-
                     self.logger.eval(self.step, val_loss)
 
                     if val_loss < self.best_val_loss:
-
                         self.best_val_loss = val_loss
-
                         save_checkpoint(
-                            model,
-                            optimizer,
-                            self.step,
-                            f"checkpoints/best/best_{self.step}.pt"
+                            model, optimizer, self.step,
+                            f"checkpoints/best/best_{self.step}.pt",
                         )
-
                         self.logger.checkpoint(self.step, val_loss)
 
-                # ---------------------------
-                # Step update
-                # ---------------------------
+                # ── step update ─────────────────────────────
                 self.step += 1
                 self.progress.update(1)
 
@@ -180,32 +122,22 @@ class Trainer:
 
         self.progress.close()
 
-    # ------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------
+    # ── evaluation ───────────────────────────────────────────
     @torch.no_grad()
     def evaluate(self):
-
         self.model.eval()
-
         losses = []
 
         for batch in self.val_loader:
-
             x, y = batch
-
             x = x.to(self.device)
             y = y.to(self.device)
-
             logits = self.model(x)
-
-            loss = F.cross_entropy(
+            loss   = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
-                y.reshape(-1)
+                y.reshape(-1),
             )
-
             losses.append(loss.item())
 
         self.model.train()
-
         return sum(losses) / len(losses)
