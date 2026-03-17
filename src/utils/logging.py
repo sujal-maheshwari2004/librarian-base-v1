@@ -1,4 +1,5 @@
 import time
+import os
 import torch
 import requests
 from tqdm import tqdm
@@ -8,6 +9,9 @@ GREEN = "\033[92m"
 BLUE = "\033[94m"
 YELLOW = "\033[93m"
 RESET = "\033[0m"
+
+# Read once at import time — set DASHBOARD_KEY in your .env or shell
+_DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "")
 
 
 class TrainingLogger:
@@ -20,20 +24,27 @@ class TrainingLogger:
         self.last_time = time.time()
         self.tokens_seen = 0
 
-        # Unique run identifier
         self.run_id = int(time.time())
 
-        # API endpoint
         self.api_endpoint = "https://librarian-logging-api-point.onrender.com/train_metrics"
+
+        # Auth header sent with every POST — server doesn't gate /train_metrics
+        # but having the key here means you can add ingest auth later with zero
+        # changes to this file.
+        self._headers = {
+            "Content-Type": "application/json",
+            **({"X-Dashboard-Key": _DASHBOARD_KEY} if _DASHBOARD_KEY else {}),
+        }
 
         tqdm.write("────────────────────────────────────────")
         tqdm.write("RUN START")
         tqdm.write(f"run_id: {self.run_id}")
         tqdm.write(f"seq_len: {seq_len} | batch: {batch_size}")
+        tqdm.write(f"logging key: {'set' if _DASHBOARD_KEY else 'NOT SET — metrics will still send'}")
         tqdm.write("────────────────────────────────────────")
 
     # ------------------------------------------------
-    # Throughput calculation
+    # Throughput
     # ------------------------------------------------
     def throughput(self):
 
@@ -60,24 +71,22 @@ class TrainingLogger:
         return 0
 
     # ------------------------------------------------
-    # Send metrics to API
+    # Send
     # ------------------------------------------------
     def send_metrics(self, payload):
 
         try:
-
             requests.post(
                 self.api_endpoint,
                 json=payload,
+                headers=self._headers,
                 timeout=0.5
             )
-
         except Exception:
-            # Never interrupt training if API fails
             pass
 
     # ------------------------------------------------
-    # Train logging
+    # Train
     # ------------------------------------------------
     def train(self, step, loss, lr, grad):
 
@@ -109,7 +118,7 @@ class TrainingLogger:
         )
 
     # ------------------------------------------------
-    # Eval logging
+    # Eval
     # ------------------------------------------------
     def eval(self, step, val_loss):
 
@@ -130,7 +139,7 @@ class TrainingLogger:
         )
 
     # ------------------------------------------------
-    # Checkpoint logging
+    # Checkpoint
     # ------------------------------------------------
     def checkpoint(self, step, val_loss):
 
