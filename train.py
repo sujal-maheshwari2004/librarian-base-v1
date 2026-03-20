@@ -1,85 +1,103 @@
+import argparse
 import os
-import time
 import torch
 from torch.utils.data import DataLoader
 
 from configs.load_configs import load_model_config, load_train_config
 from src.model.gpt import GPT
-from src.data.dataset import PackedDataset
 from src.training.trainer import Trainer
-from src.utils.logging import StageLogger
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+from src.data.dataset import PackedDataset
+from src.training.checkpoint import load_checkpoint
 
 
 def main():
-    # Read the shared RUN_ID set by train.ps1 so all pipeline stages
-    # appear under the same run. Falls back to a new timestamp when
-    # running train.py standalone (outside the full pipeline).
-    run_id = int(os.environ.get("RUN_ID", 0)) or int(time.time())
 
-    stage_log = StageLogger(run_id=run_id)
+    parser = argparse.ArgumentParser()
 
-    # ── load configs ────────────────────────────────────────
-    model_config = load_model_config("configs/model_130M.json")
-    train_config = load_train_config("configs/train_130M.json")
+    parser.add_argument("--model_config", required=True)
+    parser.add_argument("--train_config", required=True)
+    parser.add_argument("--resume", default=None)
 
-    # ── build model ─────────────────────────────────────────
-    model = GPT(model_config)
+    args = parser.parse_args()
 
-    # ── datasets ────────────────────────────────────────────
+    # ─────────────────────────────────────
+    # Load configs
+    # ─────────────────────────────────────
+    model_config = load_model_config(args.model_config)
+    train_config = load_train_config(args.train_config)
+
+    device = train_config.device if torch.cuda.is_available() else "cpu"
+
+    # ─────────────────────────────────────
+    # Model
+    # ─────────────────────────────────────
+    model = GPT(model_config).to(device)
+
+    # ─────────────────────────────────────
+    # Resume
+    # ─────────────────────────────────────
+    start_step = 0
+    optimizer = None
+
+    if args.resume:
+        print(f"Resuming from {args.resume}")
+        start_step = load_checkpoint(model, optimizer, args.resume)
+
+    # ─────────────────────────────────────
+    # Dataset
+    # ─────────────────────────────────────
     train_dataset = PackedDataset(
         "data/tokenized/train_packed.bin",
         model_config.max_seq_len
     )
+
     val_dataset = PackedDataset(
         "data/tokenized/validation_packed.bin",
         model_config.max_seq_len
     )
+
+    if len(train_dataset) <= 0:
+        raise ValueError("Train dataset is empty")
+
+    if len(val_dataset) <= 0:
+        raise ValueError("Validation dataset is empty")
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_config.batch_size,
         shuffle=True,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=True
     )
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_config.batch_size,
+        shuffle=False,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=True
     )
 
-    # ── training stage ──────────────────────────────────────
-    stage_log.start("train")
-    stage_log.progress("train", {
-        "model_params":  sum(p.numel() for p in model.parameters()),
-        "train_samples": len(train_dataset),
-        "val_samples":   len(val_dataset),
-        "total_steps":   train_config.total_steps,
-        "batch_size":    train_config.batch_size,
-    })
+    # ─────────────────────────────────────
+    # Trainer
+    # ─────────────────────────────────────
+    run_id = int(os.environ.get("RUN_ID", 0)) or None
 
     trainer = Trainer(
         model,
         train_loader,
         val_loader,
         train_config,
-        device=train_config.device,
-        run_id=run_id,
+        device,
+        run_id=run_id
     )
 
-    try:
-        trainer.train()
-        stage_log.end("train", {
-            "steps_completed": trainer.step,
-            "best_val_loss":   round(trainer.best_val_loss, 4),
-        })
-    except Exception as e:
-        stage_log.error("train", str(e))
-        raise
+    trainer.step = start_step
+
+    # ─────────────────────────────────────
+    # Train
+    # ─────────────────────────────────────
+    trainer.train()
 
 
 if __name__ == "__main__":
