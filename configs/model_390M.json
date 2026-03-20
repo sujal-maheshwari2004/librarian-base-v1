@@ -1,16 +1,19 @@
 {
-  "vocab_size": 16000,
+  "batch_size": 16,
+  "grad_accum": 8,
 
-  "dim": 1024,
-  "n_layers": 24,
-  "n_heads": 16,
-  "hidden_dim": 4096,
+  "lr": 0.0003,
+  "min_lr": 0.00003,
 
-  "max_seq_len": 512,
+  "warmup_steps": 2000,
+  "total_steps": 300000,
 
-  "dropout": 0.1,
+  "weight_decay": 0.1,
 
-  "rope_theta": 10000,
+  "eval_interval": 2000,
+  "save_interval": 5000,
 
-  "tie_embeddings": true
+  "mixed_precision": true,
+
+  "device": "cuda"
 }
