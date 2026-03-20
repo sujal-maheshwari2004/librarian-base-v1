@@ -41,7 +41,7 @@ def main():
 
     try:
         # ── model ──────────────────────────────────────────
-        model_config = load_model_config("configs/model_dummy.json")
+        model_config = load_model_config("configs/model_390M.json")
         model        = GPT(model_config).to(args.device)
         load_checkpoint(model, None, args.checkpoint)
         model.eval()
