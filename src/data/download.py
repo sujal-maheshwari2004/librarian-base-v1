@@ -11,111 +11,133 @@ from src.utils.logging import StageLogger
 _RUN_ID = int(os.environ.get("RUN_ID", 0)) or None
 
 
+def _save_split(dataset, file_path: Path, log, tag: str) -> int:
+    """Write a HF dataset split to a flat .txt file, return doc count."""
+    rows = 0
+    with file_path.open("w", encoding="utf-8") as f:
+        for example in dataset:
+            text = (example.get("text") or "").strip()
+            if text:
+                f.write(text + "\n\n")
+                rows += 1
+    if log:
+        log.progress("download", {
+            "file": file_path.name,
+            "rows": rows,
+            "tag":  tag,
+        })
+    print(f"  Saved {file_path.name}  ({rows:,} docs)")
+    return rows
+
+
 def download_datasets(
-    use_fraction: float = 1.0,
     seed: int = 42,
     output_dir: str = "data/raw",
     stage_logger: StageLogger | None = None,
 ):
-    assert 0 < use_fraction <= 1.0, "use_fraction must be between 0 and 1"
-
+    """
+    Download WikiText-103, BookCorpus, and OpenWebText at full scale.
+    No fraction truncation here — sampling is handled in clean.py's
+    weighted merge so we retain full flexibility.
+    """
     log = stage_logger
-
     random.seed(seed)
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # ----------------------------------------
-    # TinyStories
-    # ----------------------------------------
-    if log: log.progress("download", {"dataset": "TinyStories", "status": "downloading"})
-    print("Downloading TinyStories...")
-    tiny = load_dataset("roneneldan/TinyStories")
+    summary = {}
 
-    tiny_files = 0
-    tiny_rows  = 0
+    # ────────────────────────────────────────────────────────
+    # 1.  WikiText-103
+    #     ~600K rows, ~140M tokens
+    #     3 splits: train / validation / test
+    # ────────────────────────────────────────────────────────
+    print("\n── WikiText-103 ──────────────────────────────────────")
+    if log:
+        log.progress("download", {"dataset": "WikiText-103", "status": "downloading"})
 
-    for split in tiny.keys():
-        dataset = tiny[split]
-
-        if use_fraction < 1.0:
-            dataset = dataset.shuffle(seed=seed)
-            keep_size = int(len(dataset) * use_fraction)
-            dataset = dataset.select(range(keep_size))
-
-        file_path = output_path / f"tinystories_{split}.txt"
-
-        with file_path.open("w", encoding="utf-8") as f:
-            for example in dataset:
-                text = example.get("text", "").strip()
-                if text:
-                    f.write(text + "\n\n")
-
-        tiny_files += 1
-        tiny_rows  += len(dataset)
-        print(f"Saved {file_path}")
-
-        if log:
-            log.progress("download", {
-                "tinystories_split": split,
-                "rows": len(dataset),
-                "file": file_path.name,
-            })
-
-    # ----------------------------------------
-    # WikiText
-    # ----------------------------------------
-    if log: log.progress("download", {"dataset": "WikiText-103", "status": "downloading"})
-    print("Downloading WikiText...")
-    wiki = load_dataset("wikitext", "wikitext-103-raw-v1")
-
-    wiki_files = 0
-    wiki_rows  = 0
+    wiki      = load_dataset("wikitext", "wikitext-103-raw-v1")
+    wiki_rows = 0
 
     for split in wiki.keys():
-        dataset = wiki[split]
+        rows = _save_split(
+            wiki[split],
+            output_path / f"wikitext_{split}.txt",
+            log,
+            f"wiki/{split}",
+        )
+        wiki_rows += rows
 
-        if use_fraction < 1.0:
-            dataset = dataset.shuffle(seed=seed)
-            keep_size = int(len(dataset) * use_fraction)
-            dataset = dataset.select(range(keep_size))
+    summary["wikitext_splits"] = len(wiki)
+    summary["wikitext_rows"]   = wiki_rows
 
-        file_path = output_path / f"wikitext_{split}.txt"
+    # ────────────────────────────────────────────────────────
+    # 2.  BookCorpus
+    #     ~74M sentences of long-form narrative prose
+    #     1 split: train only
+    # ────────────────────────────────────────────────────────
+    print("\n── BookCorpus ────────────────────────────────────────")
+    if log:
+        log.progress("download", {"dataset": "BookCorpus", "status": "downloading"})
 
-        with file_path.open("w", encoding="utf-8") as f:
-            for example in dataset:
-                text = example.get("text", "").strip()
-                if text:
-                    f.write(text + "\n\n")
+    books     = load_dataset("bookcorpus", trust_remote_code=True)
+    book_rows = 0
 
-        wiki_files += 1
-        wiki_rows  += len(dataset)
-        print(f"Saved {file_path}")
+    for split in books.keys():
+        rows = _save_split(
+            books[split],
+            output_path / f"bookcorpus_{split}.txt",
+            log,
+            f"books/{split}",
+        )
+        book_rows += rows
 
-        if log:
-            log.progress("download", {
-                "wikitext_split": split,
-                "rows": len(dataset),
-                "file": file_path.name,
-            })
+    summary["bookcorpus_splits"] = len(books)
+    summary["bookcorpus_rows"]   = book_rows
+
+    # ────────────────────────────────────────────────────────
+    # 3.  OpenWebText
+    #     ~8M documents of quality web text (Reddit upvoted links)
+    #     1 split: train only
+    #     Full download — weighted merge in clean.py handles sampling
+    # ────────────────────────────────────────────────────────
+    print("\n── OpenWebText ───────────────────────────────────────")
+    if log:
+        log.progress("download", {"dataset": "OpenWebText", "status": "downloading"})
+
+    owt      = load_dataset("openwebtext", trust_remote_code=True)
+    owt_rows = 0
+
+    for split in owt.keys():
+        rows = _save_split(
+            owt[split],
+            output_path / f"openwebtext_{split}.txt",
+            log,
+            f"owt/{split}",
+        )
+        owt_rows += rows
+
+    summary["openwebtext_splits"] = len(owt)
+    summary["openwebtext_rows"]   = owt_rows
+
+    # ────────────────────────────────────────────────────────
+    summary["total_files"] = (
+        summary["wikitext_splits"] +
+        summary["bookcorpus_splits"] +
+        summary["openwebtext_splits"]
+    )
 
     print("\nDownload complete.")
-
-    return {
-        "tinystories_splits": tiny_files,
-        "tinystories_rows":   tiny_rows,
-        "wikitext_splits":    wiki_files,
-        "wikitext_rows":      wiki_rows,
-        "total_files":        tiny_files + wiki_files,
-    }
+    return summary
 
 
 if __name__ == "__main__":
     log = StageLogger(run_id=_RUN_ID)
     log.start("download")
     try:
-        summary = download_datasets(use_fraction=0.33, stage_logger=log)
-        log.end("download", summary)
+        s = download_datasets(stage_logger=log)
+        log.end("download", s)
     except Exception as e:
         log.error("download", str(e))
         raise
