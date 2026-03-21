@@ -1,5 +1,5 @@
 {
-    "vocab_size": 16000,
+    "vocab_size": 32000,
     "model": "BPE",
     "pre_tokenizer": "ByteLevel",
     "normalizer": "NFKC",
