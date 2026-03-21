@@ -4,7 +4,7 @@ from tqdm import tqdm
 
 from .optimizer import build_optimizer
 from .scheduler import cosine_lr
-from .checkpoint import save_checkpoint
+from .checkpoint import save_checkpoint, save_latest
 from src.utils.logging import TrainingLogger
 
 
@@ -58,7 +58,7 @@ class Trainer:
         optimizer = self.optimizer
         config    = self.config
 
-        scaler    = torch.amp.GradScaler("cuda", enabled=config.mixed_precision)
+        scaler   = torch.amp.GradScaler("cuda", enabled=config.mixed_precision)
 
         model.train()
         grad_norm = 0.0
@@ -112,6 +112,9 @@ class Trainer:
                             f"checkpoints/best/best_{self.step}.pt",
                         )
                         self.logger.checkpoint(self.step, val_loss)
+
+                    # always persist latest so --resume works
+                    save_latest(model, optimizer, self.step)
 
                 # ── step update ─────────────────────────────
                 self.step += 1
