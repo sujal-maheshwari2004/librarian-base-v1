@@ -1,6 +1,5 @@
 import sys
 from pathlib import Path
-# Insert project root (two levels up from tokenizer/train_tokenizer.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tokenizers import Tokenizer
@@ -20,7 +19,7 @@ from src.utils.logging import StageLogger
 
 DATA_FILE      = Path("data/cleaned/merged_train.txt")
 TOKENIZER_DIR  = Path("tokenizer")
-VOCAB_SIZE     = 16000
+VOCAB_SIZE     = 32000
 MIN_FREQUENCY  = 2
 SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
 
@@ -73,11 +72,11 @@ def train_tokenizer(stage_logger: StageLogger | None = None):
     tokenizer.save(str(TOKENIZER_DIR / "tokenizer.json"))
 
     config = {
-        "vocab_size":    tokenizer.get_vocab_size(),
-        "model":         "BPE",
-        "pre_tokenizer": "ByteLevel",
-        "normalizer":    "NFKC",
-        "min_frequency": MIN_FREQUENCY,
+        "vocab_size":     tokenizer.get_vocab_size(),
+        "model":          "BPE",
+        "pre_tokenizer":  "ByteLevel",
+        "normalizer":     "NFKC",
+        "min_frequency":  MIN_FREQUENCY,
         "special_tokens": SPECIAL_TOKENS,
     }
     with open(TOKENIZER_DIR / "tokenizer_config.json", "w") as f:
