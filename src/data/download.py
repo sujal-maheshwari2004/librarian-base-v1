@@ -35,11 +35,6 @@ def download_datasets(
     output_dir: str = "data/raw",
     stage_logger: StageLogger | None = None,
 ):
-    """
-    Download WikiText-103, BookCorpus, and OpenWebText at full scale.
-    No fraction truncation here — sampling is handled in clean.py's
-    weighted merge so we retain full flexibility.
-    """
     log = stage_logger
     random.seed(seed)
 
@@ -50,14 +45,12 @@ def download_datasets(
 
     # ────────────────────────────────────────────────────────
     # 1.  WikiText-103
-    #     ~600K rows, ~140M tokens
-    #     3 splits: train / validation / test
     # ────────────────────────────────────────────────────────
     print("\n── WikiText-103 ──────────────────────────────────────")
     if log:
         log.progress("download", {"dataset": "WikiText-103", "status": "downloading"})
 
-    wiki      = load_dataset("wikitext", "wikitext-103-raw-v1")
+    wiki      = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1")
     wiki_rows = 0
 
     for split in wiki.keys():
@@ -74,8 +67,6 @@ def download_datasets(
 
     # ────────────────────────────────────────────────────────
     # 2.  BookCorpus
-    #     ~74M sentences of long-form narrative prose
-    #     1 split: train only
     # ────────────────────────────────────────────────────────
     print("\n── BookCorpus ────────────────────────────────────────")
     if log:
@@ -98,9 +89,6 @@ def download_datasets(
 
     # ────────────────────────────────────────────────────────
     # 3.  OpenWebText
-    #     ~8M documents of quality web text (Reddit upvoted links)
-    #     1 split: train only
-    #     Full download — weighted merge in clean.py handles sampling
     # ────────────────────────────────────────────────────────
     print("\n── OpenWebText ───────────────────────────────────────")
     if log:
@@ -121,7 +109,6 @@ def download_datasets(
     summary["openwebtext_splits"] = len(owt)
     summary["openwebtext_rows"]   = owt_rows
 
-    # ────────────────────────────────────────────────────────
     summary["total_files"] = (
         summary["wikitext_splits"] +
         summary["bookcorpus_splits"] +
