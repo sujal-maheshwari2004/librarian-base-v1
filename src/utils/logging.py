@@ -55,7 +55,7 @@ STAGE_ICONS = {
 # ────────────────────────────────────────────────────────────
 class _BaseSender:
 
-    API_BASE = "https://librarian-logging-api-point.onrender.com"
+    API_BASE = "https://librarian-logging-api-point.vercel.app/"
 
     def __init__(self):
         self._headers = {
