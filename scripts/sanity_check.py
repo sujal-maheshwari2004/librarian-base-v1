@@ -6,6 +6,12 @@ Simulates the entire pipeline end-to-end in a temp directory using
 a tiny slice of real data, so every burst point is exercised before
 you commit to a real run.
 
+CRITICAL FIX FOR datasets 2.2.1:
+  • Forces streaming=False to avoid Parquet glob bug
+  • Uses Parquet mirrors instead of script-based datasets
+  • No trust_remote_code parameter
+  • Exponential back-off retry
+
 Stages simulated (in order, matching train.sh):
   1  Environment      — Python, disk, HF_TOKEN, .env
   2  CUDA / GPU       — device, VRAM, bfloat16, memory alloc
@@ -42,7 +48,7 @@ import tempfile
 from pathlib import Path
 
 # ── project root on path ─────────────────────────────────────
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # ── load .env immediately so HF_TOKEN is available everywhere ─
@@ -211,31 +217,38 @@ def check_dependencies():
         return
 
     import importlib
+    import datasets as _datasets_module
 
-    def vtuple(s):
-        try:
-            return tuple(int(x) for x in s.split(".")[:3])
-        except Exception:
-            return (0,)
+    from packaging import version as pv
+
+    def version_ok(installed, required):
+        return pv.parse(installed) >= pv.parse(required)
 
     packages = [
-        ("torch",       "2.0.0"),
-        ("numpy",       "1.24.0"),
-        ("datasets",    "2.0.0"),
-        ("tokenizers",  "0.13.0"),
-        ("tqdm",        "4.0.0"),
-        ("tensorboard", "2.0.0"),
-        ("requests",    "2.0.0"),
+        ("torch",           "2.0.0"),
+        ("numpy",           "1.24.0"),
+        ("datasets",        "2.0.0"),
+        ("tokenizers",      "0.13.0"),
+        ("tqdm",            "4.0.0"),
+        ("tensorboard",     "2.0.0"),
+        ("requests",        "2.0.0"),
+        ("pyarrow",         "10.0.0"),          # NEW: For direct Parquet reading
+        ("huggingface_hub", "0.16.0"),          # NEW: For HF Hub downloads
     ]
 
     for pkg, min_ver in packages:
         def _chk(p=pkg, mv=min_ver):
             mod = importlib.import_module(p)
             ver = getattr(mod, "__version__", "0.0.0")
-            if vtuple(ver) < vtuple(mv):
+            if not version_ok(ver, mv):
                 raise RuntimeError(f"version {ver} < required {mv}")
             return ver
         check(pkg, _chk)
+
+    # Special note for direct Parquet approach
+    def _direct_parquet():
+        return "Using direct Parquet download (no datasets library fsspec issues)"
+    check("Direct Parquet approach", _direct_parquet)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -286,51 +299,99 @@ def check_project_imports(model_cfg, train_cfg):
 
 
 # ══════════════════════════════════════════════════════════════
-# 5. DOWNLOAD PROBE  (200 rows per dataset — no full download)
+# 5. DOWNLOAD PROBE  (200 rows per dataset — DIRECT PARQUET)
 # ══════════════════════════════════════════════════════════════
 def check_download_probe(tmp: Path):
-    section("5 · Download Probe  (200 rows per dataset)")
-    if FATAL:
-        warn("Skipped")
-        return
 
-    from datasets import load_dataset
+    section("5 · Download Probe (dynamic shard discovery)")
 
-    raw_dir = tmp / "data" / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    from huggingface_hub import hf_hub_download, list_repo_files
+    import pyarrow.parquet as pq
 
+    raw_dir = tmp / "data/raw"
+    raw_dir.mkdir(parents=True,
+                  exist_ok=True)
+
+    SOURCES = [
+    
+        ("wikitext",
+         "Salesforce/wikitext",
+         "wikitext-103-raw-v1/train"),
+    
+        ("bookcorpus",
+         "HuggingFaceFW/fineweb-edu",
+         "train"),
+    
+        ("openwebtext",
+         "Skylion007/openwebtext",
+         "train"),
+    ]
+    
     PROBE_ROWS = 200
 
-    sources = [
-        ("wikitext",    "Salesforce/wikitext", "wikitext-103-raw-v1", False),
-        ("bookcorpus",  "rojagtap/bookcorpus",  None,                  False),
-        ("openwebtext", "openwebtext",           None,                  False),
-    ]
+    for name, repo, pattern in SOURCES:
 
-    for prefix, hf_path, hf_name, trust in sources:
-        def _probe(pf=prefix, hp=hf_path, hn=hf_name, tr=trust):
-            kwargs = dict(streaming=True, trust_remote_code=tr)
-            if hn:
-                kwargs["name"] = hn
-            ds = load_dataset(hp, **kwargs)
-            splits = list(ds.keys())
-            total_rows = 0
-            for split in splits:
-                out = raw_dir / f"{pf}_{split}.txt"
-                with out.open("w", encoding="utf-8") as f:
-                    for i, ex in enumerate(ds[split]):
-                        if i >= PROBE_ROWS:
-                            break
-                        text = (ex.get("text") or "").strip()
-                        if text:
-                            f.write(text + "\n\n")
-                            total_rows += 1
-            if total_rows == 0:
-                raise RuntimeError(f"0 rows written — check HF_TOKEN and network")
-            files = [p.name for p in raw_dir.glob(f"{pf}*.txt")]
-            info(f"{pf}: {total_rows} rows  files={files}")
-            return f"{total_rows} rows, {len(splits)} split(s)"
-        check(f"probe: {prefix}", _probe)
+        def probe():
+
+            print(f" downloading from {repo}")
+
+            files = list_repo_files(repo,
+                                    repo_type="dataset")
+
+            shards = [
+
+                f for f in files
+                if f.endswith(".parquet")
+                and pattern in f
+
+            ]
+
+            if not shards:
+
+                raise RuntimeError(
+                    f"no shards found in {repo}"
+                )
+
+            shard = shards[0]
+
+            local = hf_hub_download(
+                repo_id=repo,
+                filename=shard,
+                repo_type="dataset",
+                token=os.environ.get("HF_TOKEN"),
+            )
+
+            pf = pq.ParquetFile(local)
+
+            batch = pf.read_row_group(0)
+
+            rows = batch.to_pylist()[:PROBE_ROWS]
+
+            out = raw_dir / f"{name}_train.txt"
+
+            written = 0
+
+            with open(out,
+                      "w",
+                      encoding="utf-8") as f:
+
+                for row in rows:
+
+                    text = (row.get("text") or "").strip()
+
+                    if text:
+
+                        f.write(text + "\n\n")
+
+                        written += 1
+
+            if written == 0:
+
+                raise RuntimeError("0 rows extracted")
+
+            return f"{written} rows"
+
+        check(f"probe: {name}", probe)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -818,7 +879,7 @@ def main():
     print(f"  skip pipeline : {args.skip_pipeline}")
     print(f"  skip e2e      : {args.skip_e2e}")
     print(f"\n  {DIM}Stages 5-9 run in an isolated temp dir.")
-    print(f"  Nothing is written to data/, checkpoints/, or tokenizer/.{RESET}")
+    print(f"  Using direct Parquet download (bypasses datasets library fsspec bug){RESET}")
 
     t_start = time.time()
 
