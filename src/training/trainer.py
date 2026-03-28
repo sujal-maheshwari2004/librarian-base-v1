@@ -14,7 +14,7 @@ class Trainer:
         self,
         model,
         train_loader,
-        val_loader,
+        val_loader,          # may be None
         train_config,
         device,
         run_id: int | None = None,
@@ -25,8 +25,7 @@ class Trainer:
         self.config       = train_config
         self.device       = device
 
-        self.optimizer = build_optimizer(model, train_config)
-
+        self.optimizer     = build_optimizer(model, train_config)
         self.step          = 0
         self.best_val_loss = float("inf")
 
@@ -35,7 +34,6 @@ class Trainer:
             batch_size=train_config.batch_size,
             run_id=run_id,
         )
-
         self.progress = tqdm(
             total=train_config.total_steps,
             desc="training",
@@ -45,48 +43,42 @@ class Trainer:
 
     # ── gradient norm ────────────────────────────────────────
     def grad_norm(self):
-        total_norm = 0.0
+        total = 0.0
         for p in self.model.parameters():
-            if p.grad is None:
-                continue
-            total_norm += p.grad.data.norm(2).item() ** 2
-        return total_norm ** 0.5
+            if p.grad is not None:
+                total += p.grad.data.norm(2).item() ** 2
+        return total ** 0.5
 
     # ── training loop ────────────────────────────────────────
     def train(self):
         model     = self.model
         optimizer = self.optimizer
         config    = self.config
-
-        scaler   = torch.amp.GradScaler("cuda", enabled=config.mixed_precision)
+        scaler    = torch.amp.GradScaler("cuda", enabled=config.mixed_precision)
 
         model.train()
         grad_norm = 0.0
 
         while self.step < config.total_steps:
-
             for batch in self.train_loader:
-
                 x, y = batch
                 x = x.to(self.device, non_blocking=True)
                 y = y.to(self.device, non_blocking=True)
 
-                # ── forward ─────────────────────────────────
                 with torch.amp.autocast("cuda", enabled=config.mixed_precision):
                     logits = model(x)
                     loss   = F.cross_entropy(
                         logits.reshape(-1, logits.size(-1)),
                         y.reshape(-1),
-                    )
-                    loss = loss / config.grad_accum
+                    ) / config.grad_accum
 
-                # ── backward ────────────────────────────────
                 scaler.scale(loss).backward()
 
-                # ── optimizer step ──────────────────────────
                 if (self.step + 1) % config.grad_accum == 0:
                     scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), 1.0
+                    )
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
@@ -95,13 +87,14 @@ class Trainer:
                     for g in optimizer.param_groups:
                         g["lr"] = config.lr * lr_mult
 
-                # ── logging ─────────────────────────────────
                 if self.step % 100 == 0:
                     lr = optimizer.param_groups[0]["lr"]
                     self.logger.train(self.step, loss.item(), lr, grad_norm)
 
-                # ── evaluation ──────────────────────────────
-                if self.step % config.eval_interval == 0 and self.step != 0:
+                # ── evaluation (only if val_loader provided) ─
+                if (self.val_loader is not None
+                        and self.step % config.eval_interval == 0
+                        and self.step != 0):
                     val_loss = self.evaluate()
                     self.logger.eval(self.step, val_loss)
 
@@ -113,10 +106,8 @@ class Trainer:
                         )
                         self.logger.checkpoint(self.step, val_loss)
 
-                    # always persist latest so --resume works
                     save_latest(model, optimizer, self.step)
 
-                # ── step update ─────────────────────────────
                 self.step += 1
                 self.progress.update(1)
 
@@ -130,7 +121,6 @@ class Trainer:
     def evaluate(self):
         self.model.eval()
         losses = []
-
         for batch in self.val_loader:
             x, y = batch
             x = x.to(self.device)
@@ -141,6 +131,5 @@ class Trainer:
                 y.reshape(-1),
             )
             losses.append(loss.item())
-
         self.model.train()
         return sum(losses) / len(losses)
