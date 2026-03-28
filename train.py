@@ -17,22 +17,12 @@ _RUN_ID = int(os.environ.get("RUN_ID", 0)) or None
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Librarian Base v1")
-    parser.add_argument(
-        "--model_config",
-        type=str,
-        default="configs/model_130M.json",
-    )
-    parser.add_argument(
-        "--train_config",
-        type=str,
-        default="configs/train_130M.json",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint to resume from",
-    )
+    parser.add_argument("--model_config", type=str,
+                        default="configs/model_390M.json")
+    parser.add_argument("--train_config", type=str,
+                        default="configs/train_390M.json")
+    parser.add_argument("--resume",       type=str, default=None,
+                        help="Path to checkpoint to resume from")
     return parser.parse_args()
 
 
@@ -65,7 +55,7 @@ def main():
     })
 
     # ── model ──────────────────────────────────────────────
-    model = GPT(model_config)
+    model    = GPT(model_config)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nParameters   : {n_params:,}  ({n_params/1e6:.1f}M)")
 
@@ -74,10 +64,21 @@ def main():
         "data/tokenized/train_packed.bin",
         model_config.max_seq_len,
     )
-    val_dataset = PackedDataset(
-        "data/tokenized/validation_packed.bin",
-        model_config.max_seq_len,
-    )
+
+    val_packed = "data/tokenized/validation_packed.bin"
+    if os.path.exists(val_packed):
+        val_dataset = PackedDataset(val_packed, model_config.max_seq_len)
+        val_loader  = DataLoader(
+            val_dataset,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+            pin_memory=True,
+        )
+        print(f"Val samples  : {len(val_dataset):,}")
+    else:
+        print("WARNING: validation_packed.bin not found — skipping validation")
+        val_dataset = None
+        val_loader  = None
 
     train_loader = DataLoader(
         train_dataset,
@@ -87,19 +88,12 @@ def main():
         pin_memory=True,
         drop_last=True,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=train_config.batch_size,
-        num_workers=4,
-        pin_memory=True,
-    )
 
     print(f"Train samples: {len(train_dataset):,}")
-    print(f"Val samples  : {len(val_dataset):,}")
 
     stage_log.progress("train", {
         "train_samples": len(train_dataset),
-        "val_samples":   len(val_dataset),
+        "val_samples":   len(val_dataset) if val_dataset else 0,
         "n_params_M":    round(n_params / 1e6, 1),
     })
 
@@ -125,8 +119,8 @@ def main():
     try:
         trainer.train()
         stage_log.end("train", {
-            "final_step":      trainer.step,
-            "best_val_loss":   round(trainer.best_val_loss, 4),
+            "final_step":    trainer.step,
+            "best_val_loss": round(trainer.best_val_loss, 4),
         })
     except Exception as e:
         stage_log.error("train", str(e))
