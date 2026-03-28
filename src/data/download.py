@@ -8,6 +8,7 @@ Features:
 - Manifest-based shard-level resume
 - Exponential backoff retry on every failure mode
 - No datasets.load_dataset()
+- Per-dataset shard cap to control disk usage
 """
 import os
 import time
@@ -23,27 +24,42 @@ from huggingface_hub import list_repo_files
 from src.utils.logging import StageLogger
 
 
-MAX_RETRIES    = 10
-WAIT           = 3
-CHUNK_SIZE     = 8 * 1024 * 1024   # 8 MB chunks
-CONNECT_TIMEOUT = 30               # seconds to establish connection
-READ_TIMEOUT    = 120              # seconds between chunks (not total transfer)
+MAX_RETRIES     = 10
+WAIT            = 3
+CHUNK_SIZE      = 8 * 1024 * 1024   # 8 MB chunks
+CONNECT_TIMEOUT = 30                # seconds to establish connection
+READ_TIMEOUT    = 120               # seconds between chunks (not total transfer)
 
 _RUN_ID = int(os.environ.get("RUN_ID", 0)) or None
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
+# ── Dataset configs ───────────────────────────────────────────────────
+#
+# max_shards: None  = download all discovered shards
+#             int   = cap at this many shards
+#
+# Disk budget guide (raw parquet, before text extraction):
+#   wikitext      2 shards  ~300 MB     → keep all
+#   fineweb-edu  50 shards  ~115 GB     → yields ~150 GB cleaned+tokenized
+#   openwebtext  21 shards  ~54  GB     → keep all (21 total)
+#
+# Total raw ≈ 170 GB  →  well within a 1.7 TB disk.
+# Increase fineweb-edu max_shards if you have more space.
+#
 DATASET_CONFIGS = {
-    "wikitext": [
-        ("Salesforce/wikitext", "wikitext-103-raw-v1/train"),
-    ],
-    # BookCorpus replaced with FineWeb-Edu
-    "bookcorpus": [
-        ("HuggingFaceFW/fineweb-edu", "train"),
-    ],
-    "openwebtext": [
-        ("Skylion007/openwebtext", "train"),
-    ],
+    "wikitext": {
+        "mirrors":    [("Salesforce/wikitext", "wikitext-103-raw-v1/train")],
+        "max_shards": None,   # only 2 shards total
+    },
+    "bookcorpus": {
+        "mirrors":    [("HuggingFaceFW/fineweb-edu", "train")],
+        "max_shards": 50,     # ~115 GB raw  ← tune this to your disk
+    },
+    "openwebtext": {
+        "mirrors":    [("Skylion007/openwebtext", "train")],
+        "max_shards": None,   # ~21 shards total, ~54 GB
+    },
 }
 
 
@@ -184,7 +200,10 @@ def save_manifest(output_dir: Path, name: str, manifest: dict) -> None:
 # ── per-dataset downloader ────────────────────────────────────────────
 
 def download_dataset(name: str, output_dir: Path, stage_logger=None):
-    mirrors     = DATASET_CONFIGS[name]
+    cfg         = DATASET_CONFIGS[name]
+    mirrors     = cfg["mirrors"]
+    max_shards  = cfg["max_shards"]
+
     output_file = output_dir / f"{name}_train.txt"
     cache_dir   = output_dir / ".shard_cache" / name
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -205,6 +224,14 @@ def download_dataset(name: str, output_dir: Path, stage_logger=None):
             print(f"  no shards matched pattern '{pattern}'")
             continue
 
+        # ── apply shard cap ──────────────────────────────────────────
+        if max_shards is not None and len(all_shards) > max_shards:
+            print(
+                f"  capping at {max_shards} / {len(all_shards)} shards "
+                f"(disk-budget limit)"
+            )
+            all_shards = all_shards[:max_shards]
+
         remaining = [s for s in all_shards if s not in done_shards]
         n_total   = len(all_shards)
         n_done    = len(done_shards)
@@ -219,7 +246,7 @@ def download_dataset(name: str, output_dir: Path, stage_logger=None):
         total_docs = manifest["total_docs"]
 
         for i, shard in enumerate(remaining, start=1):
-            position  = n_done + i
+            position   = n_done + i
             shard_name = shard.replace("/", "_")
             dest       = cache_dir / shard_name
 
@@ -265,6 +292,13 @@ def download_datasets(seed=42, output_dir="data/raw", stage_logger=None):
     out.mkdir(parents=True, exist_ok=True)
 
     print("\nDirect HTTP streaming download mode\n")
+
+    # Print disk budget summary before starting
+    print("Shard caps:")
+    for name, cfg in DATASET_CONFIGS.items():
+        cap = cfg["max_shards"]
+        print(f"  {name:15s}: {'all' if cap is None else f'max {cap} shards'}")
+    print()
 
     for name in DATASET_CONFIGS:
         download_dataset(name, out, stage_logger=stage_logger)
