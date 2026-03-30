@@ -14,7 +14,7 @@ RED    = "\033[91m"
 DIM    = "\033[2m"
 RESET  = "\033[0m"
 
-_DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "")
+_DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "lib-450M-large")
 
 # ────────────────────────────────────────────────────────────
 # Stage definitions — order matters for the pipeline display
@@ -55,24 +55,26 @@ STAGE_ICONS = {
 # ────────────────────────────────────────────────────────────
 class _BaseSender:
 
-    API_BASE = "https://librarian-logging-api-point.vercel.app/"
+    API_BASE = "https://librarian-logging-api-point.vercel.app"
 
     def __init__(self):
         self._headers = {
             "Content-Type": "application/json",
-            **({"X-Dashboard-Key": _DASHBOARD_KEY} if _DASHBOARD_KEY else {}),
+            "Authorization": f"Bearer {_DASHBOARD_KEY}",
         }
 
     def _post(self, endpoint: str, payload: dict):
         try:
-            requests.post(
-                f"{self.API_BASE}{endpoint}",
+            r = requests.post(
+                f"{self.API_BASE}/{endpoint}",
                 json=payload,
                 headers=self._headers,
-                timeout=0.5,
+                timeout=5,
             )
-        except Exception:
-            pass
+            if r.status_code not in (200, 201):
+                tqdm.write(f"{RED}[logger] POST {endpoint} → {r.status_code}: {r.text}{RESET}")
+        except Exception as e:
+            tqdm.write(f"{RED}[logger] POST {endpoint} failed: {e}{RESET}")
 
 
 # ────────────────────────────────────────────────────────────
@@ -117,7 +119,7 @@ class StageLogger(_BaseSender):
             f"\n{CYAN}{icon} START   {RESET}{label}"
         )
 
-        self._post("/stage_metrics", {
+        self._post("stage_metrics", {
             "run_id":    self.run_id,
             "stage":     stage,
             "event":     "start",
@@ -134,7 +136,7 @@ class StageLogger(_BaseSender):
         )
         tqdm.write(f"  {DIM}{icon}{RESET} {DIM}{label}{RESET}  {parts}")
 
-        self._post("/stage_metrics", {
+        self._post("stage_metrics", {
             "run_id":    self.run_id,
             "stage":     stage,
             "event":     "progress",
@@ -156,7 +158,7 @@ class StageLogger(_BaseSender):
             f"{DIM}elapsed {elapsed:.1f}s{RESET}  {parts}"
         )
 
-        self._post("/stage_metrics", {
+        self._post("stage_metrics", {
             "run_id":    self.run_id,
             "stage":     stage,
             "event":     "end",
@@ -169,7 +171,7 @@ class StageLogger(_BaseSender):
         label = STAGE_LABELS.get(stage, stage)
         tqdm.write(f"  {RED}✗ ERROR  {RESET}{label}  {message}")
 
-        self._post("/stage_metrics", {
+        self._post("stage_metrics", {
             "run_id":    self.run_id,
             "stage":     stage,
             "event":     "error",
@@ -219,7 +221,7 @@ class TrainingLogger(_BaseSender):
 
     # ── send ────────────────────────────────────────────────
     def _send(self, payload: dict):
-        self._post("/train_metrics", payload)
+        self._post("train_metrics", payload)
 
     # ── train ───────────────────────────────────────────────
     def train(self, step, loss, lr, grad):
