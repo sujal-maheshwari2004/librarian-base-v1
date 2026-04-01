@@ -10,14 +10,15 @@ from tokenizers.normalizers import NFKC
 from tokenizers.processors import TemplateProcessing
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 
-from pathlib import Path
 import json
 import os
+import tempfile
 import time
+from pathlib import Path
 
 from src.utils.logging import StageLogger
+from src.data.clean import iter_documents_from_shards, CLEANED_DIR
 
-DATA_FILE      = Path("data/cleaned/merged_train.txt")
 TOKENIZER_DIR  = Path("tokenizer")
 VOCAB_SIZE     = 32000
 MIN_FREQUENCY  = 2
@@ -26,12 +27,45 @@ SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
 _RUN_ID = int(os.environ.get("RUN_ID", 0)) or None
 
 
-def train_tokenizer(stage_logger: StageLogger | None = None):
-    if not DATA_FILE.exists():
+def _write_temp_corpus(tmp_path: Path, stage_logger=None) -> int:
+    """
+    Stream all cleaned shards into a single temporary text file that
+    the HuggingFace BpeTrainer can read (it requires a file path, not
+    an iterator).  The temp file is deleted after training completes.
+
+    Returns the number of lines written.
+    """
+    if not CLEANED_DIR.exists():
         raise FileNotFoundError(
-            "Merged training file not found at data/cleaned/merged_train.txt"
+            f"Cleaned shards directory not found: {CLEANED_DIR}\n"
+            "Run the clean stage before training the tokenizer."
         )
 
+    shard_files = sorted(CLEANED_DIR.rglob("*.txt"))
+    if not shard_files:
+        raise FileNotFoundError(
+            f"No cleaned shard files found under {CLEANED_DIR}"
+        )
+
+    print(f"[train_tokenizer] Streaming {len(shard_files)} shard(s) into temp corpus…")
+
+    lines_written = 0
+    with tmp_path.open("w", encoding="utf-8") as out:
+        for doc in iter_documents_from_shards(CLEANED_DIR):
+            out.write(doc + "\n")
+            lines_written += 1
+            if lines_written % 500_000 == 0:
+                print(f"[train_tokenizer]   {lines_written:,} lines streamed…")
+                if stage_logger:
+                    stage_logger.progress("train_tokenizer", {
+                        "lines_streamed": lines_written,
+                    })
+
+    print(f"[train_tokenizer] Corpus ready: {lines_written:,} lines")
+    return lines_written
+
+
+def train_tokenizer(stage_logger=None):
     TOKENIZER_DIR.mkdir(parents=True, exist_ok=True)
 
     print("\n=== Initializing Tokenizer ===")
@@ -40,25 +74,31 @@ def train_tokenizer(stage_logger: StageLogger | None = None):
         stage_logger.progress("train_tokenizer", {
             "vocab_size":    VOCAB_SIZE,
             "min_frequency": MIN_FREQUENCY,
-            "data_file":     DATA_FILE.name,
+            "shards_dir":    str(CLEANED_DIR),
         })
 
-    tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-    tokenizer.normalizer    = NFKC()
-    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
+    # Stream cleaned shards into a temp file (BpeTrainer needs a path)
+    with tempfile.TemporaryDirectory(prefix="librarian_tok_") as tmp_dir:
+        corpus_path = Path(tmp_dir) / "corpus.txt"
+        lines = _write_temp_corpus(corpus_path, stage_logger)
 
-    trainer = BpeTrainer(
-        vocab_size=VOCAB_SIZE,
-        min_frequency=MIN_FREQUENCY,
-        special_tokens=SPECIAL_TOKENS,
-    )
+        tokenizer = Tokenizer(BPE(unk_token="<unk>"))
+        tokenizer.normalizer    = NFKC()
+        tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
 
-    print("Training tokenizer...")
-    t0 = time.time()
-    tokenizer.train([str(DATA_FILE)], trainer)
-    train_elapsed = time.time() - t0
+        trainer = BpeTrainer(
+            vocab_size=VOCAB_SIZE,
+            min_frequency=MIN_FREQUENCY,
+            special_tokens=SPECIAL_TOKENS,
+        )
 
-    print("Adding BOS/EOS post-processing...")
+        print("Training tokenizer…")
+        t0 = time.time()
+        tokenizer.train([str(corpus_path)], trainer)
+        train_elapsed = time.time() - t0
+        # corpus_path is deleted automatically when the with-block exits
+
+    print("Adding BOS/EOS post-processing…")
     tokenizer.post_processor = TemplateProcessing(
         single="<bos> $A <eos>",
         special_tokens=[
@@ -68,7 +108,7 @@ def train_tokenizer(stage_logger: StageLogger | None = None):
     )
     tokenizer.decoder = ByteLevelDecoder()
 
-    print("Saving tokenizer files...")
+    print("Saving tokenizer files…")
     tokenizer.save(str(TOKENIZER_DIR / "tokenizer.json"))
 
     config = {
@@ -83,10 +123,13 @@ def train_tokenizer(stage_logger: StageLogger | None = None):
         json.dump(config, f, indent=4)
 
     print("\nTokenizer training complete.")
-    print(f"Final vocab size: {tokenizer.get_vocab_size()}")
+    print(f"Final vocab size : {tokenizer.get_vocab_size()}")
+    print(f"Lines trained on : {lines:,}")
+    print(f"Elapsed          : {train_elapsed:.1f}s")
 
     return {
         "final_vocab_size": tokenizer.get_vocab_size(),
+        "lines_trained_on": lines,
         "train_elapsed_s":  round(train_elapsed, 2),
         "special_tokens":   len(SPECIAL_TOKENS),
     }
