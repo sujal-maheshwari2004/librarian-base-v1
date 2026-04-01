@@ -200,3 +200,60 @@ if __name__ == "__main__":
     except Exception as e:
         log.error("download", str(e))
         raise
+
+
+# ── Compatibility shims (expected by sanity_check.py) ────────────────
+
+def discover(source: str, split: str) -> list[str]:
+    """
+    Return a deterministically sorted list of shard IDs for a given
+    source/split. Kept for backward compatibility with sanity_check.py.
+    """
+    manifest = StageManifest(MANIFEST_DIR / "download.json")
+    prefix   = f"{source}__{split}__"
+    return sorted(
+        sid for sid in manifest._entries if sid.startswith(prefix)
+    )
+
+
+def download_shard_to_disk(
+    shard_id_str: str,
+    manifest: StageManifest,
+    stage_log=None,
+) -> Path | None:
+    """
+    Download a single shard by its shard_id string.
+    Kept for backward compatibility with sanity_check.py.
+    Returns the output path on success, None if already done.
+    """
+    from src.pipeline.manifest import ShardState
+    if shard_id_str in manifest._entries and \
+       manifest._entries[shard_id_str].state == ShardState.DONE:
+        return Path(manifest._entries[shard_id_str].output_path)
+    # Resolve config for this shard
+    source, split, _ = shard_id_str.split("__")
+    cfg = next((c for c in DATASET_CONFIGS if c["name"] == source), None)
+    if cfg is None:
+        raise ValueError(f"Unknown source in shard_id: {source}")
+    download_source(cfg, manifest, stage_log)
+    entry = manifest._entries.get(shard_id_str)
+    return Path(entry.output_path) if entry else None
+
+
+def parquet_to_txt(parquet_path: str, out_path: str, text_col: str = "text") -> int:
+    """
+    Convert a single parquet file to a plain-text file, one document per line.
+    Kept for backward compatibility with sanity_check.py.
+    Returns number of rows written.
+    """
+    import pyarrow.parquet as pq  # type: ignore
+    table = pq.read_table(parquet_path, columns=[text_col])
+    rows  = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        for batch in table.to_batches():
+            for val in batch.column(text_col):
+                text = val.as_py()
+                if text and text.strip():
+                    f.write(text.strip() + "\n")
+                    rows += 1
+    return rows
