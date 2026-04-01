@@ -101,6 +101,33 @@ def clean_document(text: str, source: str = "") -> str:
     return text if passes_quality_checks(text) else ""
 
 
+
+# ── Compatibility shims (expected by sanity_check.py) ────────────────
+
+def iter_documents(file_path: Path):
+    """
+    Yield newline-separated documents from a cleaned shard file.
+    Kept for backward compatibility with sanity_check.py and any
+    external callers that imported this symbol from the old clean.py.
+    """
+    with file_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.strip():
+                yield line
+
+
+def iter_documents_from_shards(shards_dir: Path = None):
+    """
+    Yield all cleaned documents by streaming every shard file under
+    shards_dir (default: CLEANED_DIR). Used by train_tokenizer.py
+    so it never needs a single merged file on disk.
+    """
+    root = shards_dir or CLEANED_DIR
+    for shard_file in sorted(root.rglob("*.txt")):
+        yield from iter_documents(shard_file)
+
+
 # ── Shard-level cleaning ─────────────────────────────────────────────
 
 def _source_from_shard_id(shard_id: str) -> str:
