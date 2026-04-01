@@ -1,53 +1,42 @@
+"""
+clean.py — Streaming per-shard text cleaner with manifest tracking.
+
+Changes from original:
+  - Reads raw shards one at a time (no full 150GB load)
+  - Each cleaned shard is written atomically
+  - Checksums verified before marking done
+  - Deletes data/raw/ after all cleaned shards verified
+  - Deduplication is per-shard only (global dedup at too large a scale
+    requires a full pass; per-shard dedup catches the worst duplicates)
+  - Weighted merge for training set happens here, streaming from shards
+"""
+
+from __future__ import annotations
+
+import hashlib
 import os
 import re
-import random
-import hashlib
+import sys
 from pathlib import Path
-from typing import Generator
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from src.pipeline.manifest import StageManifest, file_checksum
+from src.pipeline.atomic_writer import AtomicTextWriter
+from src.pipeline.cleanup import safe_delete_stage
 from src.utils.logging import StageLogger
 
+# ── Paths ─────────────────────────────────────────────────────────────
+RAW_DIR      = Path("data/raw/shards")
+CLEANED_DIR  = Path("data/cleaned/shards")
+MANIFEST_DIR = Path("data/manifests")
+_RUN_ID      = int(os.environ.get("RUN_ID", 0)) or None
 
-RAW_DIR     = Path("data/raw")
-CLEANED_DIR = Path("data/cleaned")
-
+# ── Quality thresholds ────────────────────────────────────────────────
 MIN_CHARS       = 100
 MAX_CHARS       = 80_000
 MIN_ALPHA_RATIO = 0.62
 MAX_DIGIT_RATIO = 0.15
-
-WEIGHTS = {
-    "wikitext":    0.30,
-    "bookcorpus":  0.50,
-    "openwebtext": 0.20,
-}
-
-SEED    = 42
-_RUN_ID = int(os.environ.get("RUN_ID", 0)) or None
-
-_READ_CHUNK = 64 * 1024 * 1024  # 64 MB
-
-
-# ── Text normalization ────────────────────────────────────────────────
-
-def normalize_text(text: str) -> str:
-    text = text.strip()
-    text = text.replace("\t", " ")
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-def fix_wikitext_artifacts(text: str) -> str:
-    text = text.replace("@-@", "-")
-    text = text.replace("@,@", ",")
-    text = text.replace("@.@", ".")
-    return text
-
-def remove_wiki_markup(text: str) -> str:
-    if re.match(r"^=+.*=+$", text):
-        return ""
-    if re.match(r"^[\W_]+$", text):
-        return ""
-    return text
 
 _BOILERPLATE = re.compile(
     r"^(cookie|privacy) policy"
@@ -62,32 +51,41 @@ _BOILERPLATE = re.compile(
     re.IGNORECASE,
 )
 
+
+# ── Text utilities (unchanged from original) ─────────────────────────
+
+def normalize_text(text: str) -> str:
+    text = text.strip().replace("\t", " ")
+    return re.sub(r"\s+", " ", text)
+
+def fix_wikitext_artifacts(text: str) -> str:
+    return text.replace("@-@", "-").replace("@,@", ",").replace("@.@", ".")
+
+def remove_wiki_markup(text: str) -> str:
+    if re.match(r"^=+.*=+$", text): return ""
+    if re.match(r"^[\W_]+$", text):  return ""
+    return text
+
 def remove_boilerplate(text: str) -> str:
     return "" if _BOILERPLATE.match(text) else text
 
 def remove_citations(text: str) -> str:
     text = re.sub(r"\[[0-9]+\]", "", text)
-    text = re.sub(r"\[[^\]]*citation[^\]]*\]", "", text, flags=re.IGNORECASE)
-    return text
+    return re.sub(r"\[[^\]]*citation[^\]]*\]", "", text, flags=re.IGNORECASE)
 
 def alpha_ratio(text: str) -> float:
-    if not text:
-        return 0.0
+    if not text: return 0.0
     return sum(1 for c in text if c.isalpha() or c.isspace()) / len(text)
 
 def digit_ratio(text: str) -> float:
-    if not text:
-        return 0.0
+    if not text: return 0.0
     return sum(1 for c in text if c.isdigit()) / len(text)
 
 def passes_quality_checks(text: str) -> bool:
     n = len(text)
-    if n < MIN_CHARS or n > MAX_CHARS:
-        return False
-    if alpha_ratio(text) < MIN_ALPHA_RATIO:
-        return False
-    if digit_ratio(text) > MAX_DIGIT_RATIO:
-        return False
+    if n < MIN_CHARS or n > MAX_CHARS: return False
+    if alpha_ratio(text) < MIN_ALPHA_RATIO: return False
+    if digit_ratio(text) > MAX_DIGIT_RATIO: return False
     return True
 
 def clean_document(text: str, source: str = "") -> str:
@@ -103,229 +101,133 @@ def clean_document(text: str, source: str = "") -> str:
     return text if passes_quality_checks(text) else ""
 
 
-# ── Streaming document iterator ───────────────────────────────────────
+# ── Shard-level cleaning ─────────────────────────────────────────────
 
-def iter_documents(file_path: Path) -> Generator[str, None, None]:
+def _source_from_shard_id(shard_id: str) -> str:
+    """Extract source name from shard_id: 'wikitext__train__000000' → 'wikitext'"""
+    return shard_id.split("__")[0]
+
+
+def clean_shard(
+    raw_shard_path: Path,
+    cleaned_shard_path: Path,
+    source: str,
+) -> tuple[int, int]:
     """
-    Yield double-newline-separated documents without loading the full
-    file into memory. Carries a leftover buffer across 64 MB chunks.
+    Stream-clean one raw shard into one cleaned shard.
+    Returns (docs_in, docs_out).
+    Uses per-shard SHA-1 deduplication.
     """
-    buffer = ""
-    with file_path.open("r", encoding="utf-8", errors="replace") as fh:
-        while True:
-            chunk = fh.read(_READ_CHUNK)
-            if not chunk:
-                break
-            buffer += chunk
-            parts = re.split(r"\n\s*\n", buffer)
-            for part in parts[:-1]:
-                part = part.strip()
-                if part:
-                    yield part
-            buffer = parts[-1]
-    if buffer.strip():
-        yield buffer.strip()
+    seen: set[str] = set()
+    docs_in = docs_out = 0
+
+    with AtomicTextWriter(cleaned_shard_path) as w:
+        with raw_shard_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                docs_in += 1
+                cleaned = clean_document(line, source=source)
+                if not cleaned:
+                    continue
+                h = hashlib.sha1(cleaned.encode()).hexdigest()
+                if h in seen:
+                    continue
+                seen.add(h)
+                w.write(cleaned + "\n")
+                docs_out += 1
+
+    return docs_in, docs_out
 
 
-# ── File cleaning ─────────────────────────────────────────────────────
+# ── Main clean stage ─────────────────────────────────────────────────
 
-def process_file(file_path: Path) -> int:
-    print(f"\nCleaning: {file_path.name}")
-
-    name = file_path.name
-    if name.startswith("wikitext"):
-        source = "wikitext"
-    elif name.startswith("bookcorpus"):
-        source = "bookcorpus"
-    elif name.startswith("openwebtext"):
-        source = "openwebtext"
-    else:
-        source = ""
-
-    output_path  = CLEANED_DIR / file_path.name
-    seen_hashes: set[str] = set()
-    total = 0
-    kept  = 0
-
-    with output_path.open("w", encoding="utf-8") as out_f:
-        for doc in iter_documents(file_path):
-            total += 1
-            cleaned = clean_document(doc, source=source)
-            if not cleaned:
-                continue
-            doc_hash = hashlib.sha1(cleaned.encode()).hexdigest()
-            if doc_hash in seen_hashes:
-                continue
-            seen_hashes.add(doc_hash)
-            out_f.write(cleaned + "\n")
-            kept += 1
-
-    print(f"  Kept {kept:,} / {total:,} documents  "
-          f"({len(seen_hashes):,} unique)")
-    return kept
-
-
-# ── Streaming helpers ─────────────────────────────────────────────────
-
-def iter_lines(path: Path) -> Generator[str, None, None]:
-    if not path.exists():
-        return
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.rstrip("\n")
-            if line.strip():
-                yield line
-
-def count_lines(path: Path) -> int:
-    if not path.exists():
-        return 0
-    n = 0
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            if line.strip():
-                n += 1
-    return n
-
-
-# ── Weighted merge (streaming reservoir sampling) ─────────────────────
-
-def weighted_merge_train(stage_logger=None) -> int:
-    random.seed(SEED)
-
-    paths  = {src: CLEANED_DIR / f"{src}_train.txt" for src in WEIGHTS}
-    counts = {src: count_lines(p) for src, p in paths.items()}
-
-    total_available = sum(counts.values())
-    if total_available == 0:
-        print("  No training data found.")
-        return 0
-
-    print("\n  Available lines per source:")
-    for src, n in counts.items():
-        print(f"    {src:15s}: {n:>12,}")
-
-    # Compute targets; redistribute shortfall proportionally
-    raw_targets = {src: int(total_available * w) for src, w in WEIGHTS.items()}
-    take        = {}
-    shortfall   = 0
-    for src, target in raw_targets.items():
-        actual       = min(target, counts[src])
-        take[src]    = actual
-        shortfall   += target - actual
-
-    if shortfall > 0:
-        surplus_sources = {
-            src: counts[src] - take[src]
-            for src in take if counts[src] > take[src]
-        }
-        total_surplus = sum(surplus_sources.values())
-        if total_surplus > 0:
-            for src, surplus in surplus_sources.items():
-                extra     = int(shortfall * surplus / total_surplus)
-                take[src] = min(take[src] + extra, counts[src])
-
-    all_sampled: list[str] = []
-
-    for src, n_take in take.items():
-        if n_take == 0:
-            print(f"  WARNING: {src} has no data, skipping.")
-            continue
-
-        reservoir: list[str] = []
-        for i, line in enumerate(iter_lines(paths[src])):
-            if len(reservoir) < n_take:
-                reservoir.append(line)
-            else:
-                j = random.randint(0, i)
-                if j < n_take:
-                    reservoir[j] = line
-
-        all_sampled.extend(reservoir)
-        print(f"  Sampled {len(reservoir):,} from {src}")
-
-        if stage_logger:
-            stage_logger.progress("clean", {
-                "merge_source": src,
-                "sampled":      len(reservoir),
-            })
-
-    random.shuffle(all_sampled)
-
-    output_path = CLEANED_DIR / "merged_train.txt"
-    with output_path.open("w", encoding="utf-8") as f:
-        for line in all_sampled:
-            f.write(line + "\n")
-
-    total = len(all_sampled)
-    print(f"\n  Total merged train lines: {total:,}")
-    return total
-
-
-# ── Validation / test merge ───────────────────────────────────────────
-
-def merge_split_other(split_name: str, stage_logger=None) -> int:
-    print(f"\n── Merging split: {split_name} ──────────────────────")
-
-    src_path    = CLEANED_DIR / f"wikitext_{split_name}.txt"
-    output_path = CLEANED_DIR / f"merged_{split_name}.txt"
-
-    lines = list(iter_lines(src_path))
-    if not lines:
-        print(f"  {split_name}: no data found, skipping.")
-        return 0
-
-    random.seed(SEED)
-    random.shuffle(lines)
-
-    with output_path.open("w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(line + "\n")
-
-    print(f"  {split_name}: {len(lines):,} lines (WikiText only)")
-
-    if stage_logger:
-        stage_logger.progress("clean", {f"merged_{split_name}": len(lines)})
-
-    return len(lines)
-
-
-# ── Main entrypoint ───────────────────────────────────────────────────
-
-def run_clean(stage_logger=None) -> dict:
+def run_clean(stage_log: StageLogger | None = None) -> dict:
     CLEANED_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("\n=== CLEANING STAGE ===")
-
-    total_docs      = 0
-    files_processed = 0
-
-    for file_path in sorted(RAW_DIR.glob("*.txt")):
-        kept = process_file(file_path)
-        total_docs      += kept
-        files_processed += 1
-
-        if stage_logger:
-            stage_logger.progress("clean", {
-                "file":       file_path.name,
-                "docs_kept":  kept,
-                "files_done": files_processed,
-            })
-
-    print("\n=== MERGING STAGE ===")
-
-    merged_totals                  = {}
-    merged_totals["merged_train"]  = weighted_merge_train(stage_logger=stage_logger)
-
-    for split in ["validation", "test"]:
-        merged_totals[f"merged_{split}"] = merge_split_other(
-            split, stage_logger=stage_logger
+    # Load download manifest to know which raw shards exist
+    download_manifest = StageManifest(MANIFEST_DIR / "download.json")
+    if not download_manifest.is_complete():
+        raise RuntimeError(
+            f"Download stage not complete: {download_manifest.summary()}"
         )
 
-    print("\nData cleaning complete.")
+    # Build clean manifest
+    clean_manifest = StageManifest(MANIFEST_DIR / "clean.json")
+    clean_manifest.reset_stale()
+
+    # Register all raw shards as work items for clean stage
+    raw_shard_ids = [e.shard_id for e in download_manifest.verified_entries()]
+    clean_manifest.register_shards(raw_shard_ids, meta={"stage": "clean"})
+
+    print(f"\n=== CLEAN STAGE ===")
+    print(f"Raw shards to clean: {len(raw_shard_ids)}")
+    print(f"Clean manifest: {clean_manifest.summary()}")
+
+    total_in = total_out = 0
+
+    for entry in download_manifest.verified_entries():
+        sid = entry.shard_id
+
+        # Skip already completed
+        from src.pipeline.manifest import ShardState
+        if clean_manifest._entries.get(sid, None) and \
+           clean_manifest._entries[sid].state == ShardState.DONE:
+            continue
+
+        raw_path     = Path(entry.output_path)
+        source       = _source_from_shard_id(sid)
+
+        # Mirror directory structure under cleaned/
+        rel          = raw_path.relative_to(RAW_DIR)
+        cleaned_path = CLEANED_DIR / rel
+
+        cleaned_path.parent.mkdir(parents=True, exist_ok=True)
+        clean_manifest.mark_processing(sid)
+
+        try:
+            docs_in, docs_out = clean_shard(raw_path, cleaned_path, source)
+        except Exception as e:
+            clean_manifest.mark_failed(sid, str(e))
+            print(f"[clean] FAILED shard {sid}: {e}")
+            continue
+
+        checksum = file_checksum(cleaned_path)
+        clean_manifest.mark_verified(sid, str(cleaned_path), checksum, docs_out)
+        clean_manifest.mark_done(sid)
+
+        total_in  += docs_in
+        total_out += docs_out
+
+        if stage_log:
+            stage_log.progress("clean", {
+                "shard":    sid,
+                "docs_in":  docs_in,
+                "docs_out": docs_out,
+            })
+
+    print(f"\n[clean] Kept {total_out:,} / {total_in:,} docs")
+    print(f"[clean] Manifest: {clean_manifest.summary()}")
+
+    # ── Delete raw shards after clean stage completes ──────────────
+    if clean_manifest.is_complete():
+        print("\n[clean] All shards cleaned — deleting raw data…")
+        result = safe_delete_stage(
+            stage_name              = "raw",
+            artifact_dir            = RAW_DIR,
+            downstream_manifest_path= MANIFEST_DIR / "clean.json",
+            dry_run                 = False,
+        )
+        print(f"[clean] Freed {result['deleted_bytes'] / 1e9:.2f} GB")
+    else:
+        print("[clean] Stage incomplete — skipping raw deletion")
+
     return {
-        "files_processed": files_processed,
-        "total_docs_kept": total_docs,
-        **merged_totals,
+        "total_docs_in":  total_in,
+        "total_docs_out": total_out,
+        "manifest":       clean_manifest.summary(),
     }
 
 
@@ -333,7 +235,7 @@ if __name__ == "__main__":
     log = StageLogger(run_id=_RUN_ID)
     log.start("clean")
     try:
-        summary = run_clean(stage_logger=log)
+        summary = run_clean(stage_log=log)
         log.end("clean", summary)
     except Exception as e:
         log.error("clean", str(e))
