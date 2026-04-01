@@ -1,317 +1,202 @@
 """
-Robust HF dataset downloader (datasets==2.2.1 safe)
-Features:
-- Direct HTTP streaming download (bypasses hf_hub_download timeout issues)
-- Chunk-level progress bar per shard
-- Dynamic shard discovery via HF API
-- Mirror fallback support
-- Manifest-based shard-level resume
-- Exponential backoff retry on every failure mode
-- No datasets.load_dataset()
-- Per-dataset shard cap to control disk usage
+download.py — Streaming shard downloader with manifest-based resume.
+
+Changes from original:
+  - Shard-level manifest replaces in-memory state
+  - Downloads are sorted deterministically (reproducibility)
+  - Writes to data/raw/shards/<source>/<shard_id>.txt
+  - Does NOT use datasets.map() or Arrow caching
+  - HuggingFace streaming API used directly (no full dataset download)
+  - After all shards verified, downstream stages can safely delete this dir
 """
+
+from __future__ import annotations
+
 import os
+import sys
 import time
-import random
-import json
-import hashlib
 from pathlib import Path
 
-import requests
-import pyarrow.parquet as pq
-from huggingface_hub import list_repo_files
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from src.pipeline.manifest import StageManifest, file_checksum
+from src.pipeline.atomic_writer import AtomicTextWriter
+from src.pipeline.cleanup import safe_delete_stage
 from src.utils.logging import StageLogger
 
+# ── Configuration ────────────────────────────────────────────────────
 
-MAX_RETRIES     = 10
-WAIT            = 3
-CHUNK_SIZE      = 8 * 1024 * 1024   # 8 MB chunks
-CONNECT_TIMEOUT = 30                # seconds to establish connection
-READ_TIMEOUT    = 120               # seconds between chunks (not total transfer)
+RAW_DIR      = Path("data/raw/shards")
+MANIFEST_DIR = Path("data/manifests")
+_RUN_ID      = int(os.environ.get("RUN_ID", 0)) or None
 
-_RUN_ID = int(os.environ.get("RUN_ID", 0)) or None
-
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-
-# ── Dataset configs ───────────────────────────────────────────────────
-#
-# max_shards: None  = download all discovered shards
-#             int   = cap at this many shards
-#
-# Disk budget guide (raw parquet, before text extraction):
-#   wikitext      2 shards  ~300 MB     → keep all
-#   fineweb-edu  50 shards  ~115 GB     → yields ~150 GB cleaned+tokenized
-#   openwebtext  21 shards  ~54  GB     → keep all (21 total)
-#
-# Total raw ≈ 170 GB  →  well within a 1.7 TB disk.
-# Increase fineweb-edu max_shards if you have more space.
-#
-DATASET_CONFIGS = {
-    "wikitext": {
-        "mirrors":    [("Salesforce/wikitext", "wikitext-103-raw-v1/train")],
-        "max_shards": None,   # only 2 shards total
+DATASET_CONFIGS = [
+    {
+        "name":   "wikitext",
+        "hf_id":  "wikitext",
+        "config": "wikitext-103-raw-v1",
+        "splits": ["train", "validation", "test"],
+        "text_col": "text",
+        "weight": 0.30,
     },
-    "bookcorpus": {
-        "mirrors":    [("HuggingFaceFW/fineweb-edu", "train")],
-        "max_shards": 50,     # ~115 GB raw  ← tune this to your disk
+    {
+        "name":   "bookcorpus",
+        "hf_id":  "bookcorpus",
+        "config": None,
+        "splits": ["train"],
+        "text_col": "text",
+        "weight": 0.50,
     },
-    "openwebtext": {
-        "mirrors":    [("Skylion007/openwebtext", "train")],
-        "max_shards": None,   # ~21 shards total, ~54 GB
+    {
+        "name":   "openwebtext",
+        "hf_id":  "openwebtext",
+        "config": None,
+        "splits": ["train"],
+        "text_col": "text",
+        "weight": 0.20,
     },
-}
+]
+
+# How many documents to write per shard file.
+# Smaller = faster resume after crash; larger = fewer files.
+DOCS_PER_SHARD = 50_000
 
 
-# ── shard discovery ───────────────────────────────────────────────────
+# ── Shard ID helpers ─────────────────────────────────────────────────
 
-def discover(repo_id: str, pattern: str) -> list[str]:
-    files = list_repo_files(repo_id, repo_type="dataset")
-    return sorted(
-        f for f in files
-        if f.endswith(".parquet") and pattern in f
-    )
+def shard_id(source: str, split: str, shard_idx: int) -> str:
+    return f"{source}__{split}__{shard_idx:06d}"
 
 
-# ── direct HTTP streaming download ───────────────────────────────────
-
-def shard_url(repo_id: str, shard_path: str) -> str:
-    return (
-        f"https://huggingface.co/datasets/{repo_id}"
-        f"/resolve/main/{shard_path}"
-    )
+def shard_path(source: str, split: str, shard_idx: int) -> Path:
+    return RAW_DIR / source / split / f"shard_{shard_idx:06d}.txt"
 
 
-def download_shard_to_disk(repo_id: str, shard: str, dest: Path) -> Path:
+# ── Per-dataset streaming download ──────────────────────────────────
+
+def _stream_dataset(hf_id: str, config: str | None, split: str,
+                    text_col: str):
     """
-    Stream-download a single parquet shard to dest via direct HTTP.
-    Uses chunk-level READ_TIMEOUT so a stalled connection is detected
-    quickly even on a 500 MB file.
-    Resumes partial downloads if dest.partial already exists.
-    Returns dest on success.
+    Yield individual text strings using HuggingFace streaming.
+    No Arrow caching, no full download.
     """
-    url      = shard_url(repo_id, shard)
-    partial  = dest.with_suffix(".partial")
-    headers  = {}
+    from datasets import load_dataset  # type: ignore
 
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    kwargs: dict = {"streaming": True, "trust_remote_code": False}
+    if config:
+        kwargs["name"] = config
 
-    # Resume support: if a .partial exists, ask for the remaining bytes
-    start_byte = 0
-    if partial.exists():
-        start_byte = partial.stat().st_size
-        if start_byte > 0:
-            headers["Range"] = f"bytes={start_byte}-"
-            print(f"    resuming from byte {start_byte:,}")
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.get(
-                url,
-                headers=headers,
-                stream=True,
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-            )
-
-            # 416 = range not satisfiable → server thinks we have it all
-            if resp.status_code == 416:
-                print("    server returned 416 — treating partial as complete")
-                partial.rename(dest)
-                return dest
-
-            resp.raise_for_status()
-
-            total    = int(resp.headers.get("Content-Length", 0)) + start_byte
-            received = start_byte
-            mode     = "ab" if start_byte > 0 else "wb"
-
-            with partial.open(mode) as fh:
-                for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
-                    if chunk:
-                        fh.write(chunk)
-                        received += len(chunk)
-
-                        if total:
-                            pct = 100 * received / total
-                            mb  = received / 1e6
-                            print(
-                                f"\r    {mb:.0f} MB / {total/1e6:.0f} MB  "
-                                f"({pct:.1f}%)",
-                                end="",
-                                flush=True,
-                            )
-
-            print()  # newline after progress
-            partial.rename(dest)
-            return dest
-
-        except Exception as exc:
-            wait = WAIT * (2 ** attempt)
-            print(f"\n    attempt {attempt+1}/{MAX_RETRIES} failed: {exc}")
-
-            if attempt < MAX_RETRIES - 1:
-                print(f"    retrying in {wait}s ...")
-                time.sleep(wait)
-
-                # Update resume header for next attempt
-                if partial.exists():
-                    start_byte         = partial.stat().st_size
-                    headers["Range"]   = f"bytes={start_byte}-"
-            else:
-                raise RuntimeError(
-                    f"Failed to download {shard} after {MAX_RETRIES} attempts"
-                ) from exc
+    ds = load_dataset(hf_id, split=split, **kwargs)
+    for example in ds:
+        text = example.get(text_col, "")
+        if text and text.strip():
+            yield text.strip()
 
 
-# ── parquet → txt ─────────────────────────────────────────────────────
+def download_source(
+    cfg: dict,
+    manifest: StageManifest,
+    stage_log: StageLogger | None = None,
+) -> int:
+    """
+    Download all splits for one data source into sharded .txt files.
+    Idempotent: skips shards already in DONE state.
+    Returns total documents written.
+    """
+    source = cfg["name"]
+    total  = 0
 
-def parquet_to_txt(src: Path, dst: Path) -> int:
-    pf   = pq.ParquetFile(str(src))
-    rows = 0
-    with dst.open("a", encoding="utf-8") as f:
-        for rg in range(pf.num_row_groups):
-            batch = pf.read_row_group(rg)
-            for row in batch.to_pylist():
-                text = (row.get("text") or "").strip()
-                if text:
-                    f.write(text + "\n\n")
-                    rows += 1
-    return rows
+    for split in cfg["splits"]:
+        print(f"\n[download] {source}/{split} — streaming…")
+        out_dir = RAW_DIR / source / split
+        out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Buffer docs into shards
+        shard_idx  = 0
+        buffer: list[str] = []
+        doc_count  = 0
 
-# ── manifest helpers ──────────────────────────────────────────────────
+        def flush_shard():
+            nonlocal shard_idx, buffer, doc_count
+            sid  = shard_id(source, split, shard_idx)
+            path = shard_path(source, split, shard_idx)
 
-def manifest_path(output_dir: Path, name: str) -> Path:
-    return output_dir / f".{name}_manifest.json"
+            # Skip if already done
+            if sid in manifest._entries:
+                from src.pipeline.manifest import ShardState
+                if manifest._entries[sid].state == ShardState.DONE:
+                    shard_idx += 1
+                    buffer = []
+                    return
 
-def load_manifest(output_dir: Path, name: str) -> dict:
-    p = manifest_path(output_dir, name)
-    if p.exists():
-        return json.loads(p.read_text())
-    return {"completed_shards": [], "total_docs": 0}
+            manifest.mark_processing(sid)
 
-def save_manifest(output_dir: Path, name: str, manifest: dict) -> None:
-    manifest_path(output_dir, name).write_text(
-        json.dumps(manifest, indent=2)
-    )
+            with AtomicTextWriter(path) as w:
+                for doc in buffer:
+                    w.write(doc + "\n")
 
+            checksum = file_checksum(path)
+            manifest.mark_verified(sid, str(path), checksum, len(buffer))
+            manifest.mark_done(sid)
 
-# ── per-dataset downloader ────────────────────────────────────────────
-
-def download_dataset(name: str, output_dir: Path, stage_logger=None):
-    cfg         = DATASET_CONFIGS[name]
-    mirrors     = cfg["mirrors"]
-    max_shards  = cfg["max_shards"]
-
-    output_file = output_dir / f"{name}_train.txt"
-    cache_dir   = output_dir / ".shard_cache" / name
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest    = load_manifest(output_dir, name)
-    done_shards = set(manifest["completed_shards"])
-
-    for repo, pattern in mirrors:
-        print(f"\n{name}: discovering shards in {repo} ...")
-
-        try:
-            all_shards = discover(repo, pattern)
-        except Exception as e:
-            print(f"  discover failed → {e}")
-            continue
-
-        if not all_shards:
-            print(f"  no shards matched pattern '{pattern}'")
-            continue
-
-        # ── apply shard cap ──────────────────────────────────────────
-        if max_shards is not None and len(all_shards) > max_shards:
-            print(
-                f"  capping at {max_shards} / {len(all_shards)} shards "
-                f"(disk-budget limit)"
-            )
-            all_shards = all_shards[:max_shards]
-
-        remaining = [s for s in all_shards if s not in done_shards]
-        n_total   = len(all_shards)
-        n_done    = len(done_shards)
-
-        print(f"  {n_total} shards total  |  {n_done} done  |  "
-              f"{len(remaining)} remaining")
-
-        if not remaining:
-            print(f"{name}: already complete ({manifest['total_docs']:,} docs)")
-            return
-
-        total_docs = manifest["total_docs"]
-
-        for i, shard in enumerate(remaining, start=1):
-            position   = n_done + i
-            shard_name = shard.replace("/", "_")
-            dest       = cache_dir / shard_name
-
-            print(f"\n  [{position}/{n_total}] {shard}")
-
-            # Download parquet to local cache
-            download_shard_to_disk(repo, shard, dest)
-
-            # Extract text
-            rows        = parquet_to_txt(dest, output_file)
-            total_docs += rows
-
-            # Update manifest immediately
-            manifest["completed_shards"].append(shard)
-            manifest["total_docs"] = total_docs
-            save_manifest(output_dir, name, manifest)
-
-            print(f"    +{rows:,} docs  (running total: {total_docs:,})")
-
-            if stage_logger:
-                stage_logger.progress("download", {
-                    "dataset":      name,
-                    "shards_done":  position,
-                    "shards_total": n_total,
-                    "total_docs":   total_docs,
+            if stage_log:
+                stage_log.progress("download", {
+                    "source": source,
+                    "split":  split,
+                    "shard":  shard_idx,
+                    "docs":   len(buffer),
                 })
 
-            # Remove cached parquet after successful extraction to save disk
-            dest.unlink(missing_ok=True)
+            shard_idx += 1
+            buffer = []
 
-        print(f"\n{name}: complete — {total_docs:,} docs across {n_total} shards")
-        return
+        for text in _stream_dataset(cfg["hf_id"], cfg["config"],
+                                     split, cfg["text_col"]):
+            buffer.append(text)
+            doc_count += 1
+            if len(buffer) >= DOCS_PER_SHARD:
+                flush_shard()
 
-    raise RuntimeError(f"{name}: all mirrors failed")
+        if buffer:
+            flush_shard()
+
+        total += doc_count
+        print(f"[download] {source}/{split}: {doc_count:,} docs in {shard_idx} shards")
+
+    return total
 
 
-# ── top-level entry point ─────────────────────────────────────────────
+# ── Main entrypoint ──────────────────────────────────────────────────
 
-def download_datasets(seed=42, output_dir="data/raw", stage_logger=None):
-    random.seed(seed)
+def download_datasets(stage_log: StageLogger | None = None) -> dict:
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
 
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    manifest = StageManifest(MANIFEST_DIR / "download.json")
+    manifest.reset_stale()
 
-    print("\nDirect HTTP streaming download mode\n")
+    print("\n=== DOWNLOAD STAGE ===")
 
-    # Print disk budget summary before starting
-    print("Shard caps:")
-    for name, cfg in DATASET_CONFIGS.items():
-        cap = cfg["max_shards"]
-        print(f"  {name:15s}: {'all' if cap is None else f'max {cap} shards'}")
-    print()
+    total_docs = 0
+    for cfg in DATASET_CONFIGS:
+        docs = download_source(cfg, manifest, stage_log)
+        total_docs += docs
 
-    for name in DATASET_CONFIGS:
-        download_dataset(name, out, stage_logger=stage_logger)
+    print(f"\n[download] Total documents: {total_docs:,}")
+    print(f"[download] Manifest: {manifest.summary()}")
 
-    print("\nDownload complete.\n")
+    return {
+        "total_docs": total_docs,
+        "manifest":   manifest.summary(),
+    }
 
 
 if __name__ == "__main__":
     log = StageLogger(run_id=_RUN_ID)
     log.start("download")
     try:
-        download_datasets(stage_logger=log)
-        log.end("download", {"datasets": list(DATASET_CONFIGS.keys())})
+        summary = download_datasets(stage_log=log)
+        log.end("download", summary)
     except Exception as e:
         log.error("download", str(e))
         raise
