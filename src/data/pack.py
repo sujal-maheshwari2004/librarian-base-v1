@@ -250,3 +250,14 @@ if __name__ == "__main__":
     except Exception as e:
         log.error("pack", str(e))
         raise
+
+
+# ── Compatibility shim (expected by sanity_check.py) ─────────────────
+
+def pack_split(split_name: str, stage_logger=None):
+    """
+    Thin wrapper kept for backward compatibility with sanity_check.py.
+    Delegates to run_pack() filtering to a single split.
+    """
+    results = run_pack(seq_len=SEQ_LEN, stage_log=stage_logger)
+    return results.get(split_name)
