@@ -59,62 +59,24 @@ run_step () {
     eval $CMD
 }
 
-run_step "Download datasets"  "python -m src.data.download"
-run_step "Clean datasets"     "python -m src.data.clean"
+# ── Run all preprocessing stages via the orchestrator ────────────────
+# This handles download → clean → tokenize → pack with manifest-based
+# resume, shard-level progress, and automatic artifact cleanup.
+run_step "Preprocessing pipeline" "python -m src.pipeline.pipeline"
 
-[ -f data/cleaned/merged_train.txt ] || {
-    echo "ERROR: merged_train.txt missing after clean step"
+# ── Verify packed dataset exists before proceeding ───────────────────
+[ -f data/tokenized/train_packed.bin ] || {
+    echo "ERROR: train_packed.bin missing after pipeline"
     exit 1
 }
 
-run_step "Train tokenizer"    "python -m tokenizer.train_tokenizer"
+# ── Train tokenizer (reads from cleaned shards, no merged file needed) ─
+run_step "Train tokenizer" "python -m tokenizer.train_tokenizer"
 
 [ -f tokenizer/tokenizer.json ] || {
     echo "ERROR: tokenizer/tokenizer.json missing"
     exit 1
 }
-
-run_step "Tokenize dataset"   "python -m src.data.tokenizer"
-run_step "Pack tokens"        "python -m src.data.pack"
-
-[ -f data/tokenized/train_packed.bin ] || {
-    echo "ERROR: train_packed.bin missing after pack step"
-    exit 1
-}
-
-# ── Carve validation split from train if not already present ──────────
-if [ ! -f data/tokenized/validation_packed.bin ]; then
-    echo ""
-    echo "Step: Carve validation split"
-    echo "---------------------------------"
-    python - <<PYEOF
-import numpy as np
-
-SEQ_LEN  = 512
-VAL_FRAC = 0.005   # 0.5% → ~12,500 sequences at 2.5M total
-
-data  = np.memmap("data/tokenized/train_packed.bin", dtype=np.uint16, mode="r")
-n_seq = len(data) // SEQ_LEN
-
-val_seq    = max(1, int(n_seq * VAL_FRAC))
-val_tokens = val_seq * SEQ_LEN
-
-print(f"Total sequences : {n_seq:,}")
-print(f"Val  sequences  : {val_seq:,}  ({VAL_FRAC*100:.1f}%)")
-print(f"Train sequences : {n_seq - val_seq:,}")
-
-val   = np.array(data[-val_tokens:])
-train = np.array(data[:-val_tokens])
-
-val.tofile("data/tokenized/validation_packed.bin")
-train.tofile("data/tokenized/train_packed.bin")
-
-print("validation_packed.bin written")
-print("train_packed.bin  trimmed")
-PYEOF
-else
-    echo "validation_packed.bin already exists — skipping split"
-fi
 
 # ── Resume if latest checkpoint exists ───────────────────────────────
 RESUME=""
