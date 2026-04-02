@@ -5,13 +5,14 @@ Changes from original:
   - Shard-level manifest replaces in-memory state
   - Downloads are sorted deterministically (reproducibility)
   - Writes to data/raw/shards/<source>/<shard_id>.txt
-  - Does NOT use datasets.map() or Arrow caching
-  - HuggingFace streaming API used directly (no full dataset download)
+  - Wikitext fetched directly via HF parquet (bypasses broken S3 URL)
+  - bookcorpus / openwebtext use HF datasets streaming with fallback
   - After all shards verified, downstream stages can safely delete this dir
 """
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 import time
@@ -32,33 +33,45 @@ _RUN_ID      = int(os.environ.get("RUN_ID", 0)) or None
 
 DATASET_CONFIGS = [
     {
-        "name":   "wikitext",
-        "hf_id":  "wikitext",
-        "config": "wikitext-103-raw-v1",
-        "splits": ["train", "validation", "test"],
+        "name":     "wikitext",
+        "hf_id":    "wikitext",
+        "config":   "wikitext-103-raw-v1",
+        "splits":   ["train", "validation", "test"],
         "text_col": "text",
-        "weight": 0.30,
+        "weight":   0.30,
     },
     {
-        "name":   "bookcorpus",
-        "hf_id":  "bookcorpus",
-        "config": None,
-        "splits": ["train"],
+        "name":     "bookcorpus",
+        "hf_id":    "bookcorpus",
+        "config":   None,
+        "splits":   ["train"],
         "text_col": "text",
-        "weight": 0.50,
+        "weight":   0.50,
     },
     {
-        "name":   "openwebtext",
-        "hf_id":  "openwebtext",
-        "config": None,
-        "splits": ["train"],
+        "name":     "openwebtext",
+        "hf_id":    "openwebtext",
+        "config":   None,
+        "splits":   ["train"],
         "text_col": "text",
-        "weight": 0.20,
+        "weight":   0.20,
     },
 ]
 
-# How many documents to write per shard file.
-# Smaller = faster resume after crash; larger = fewer files.
+# Wikitext-103 parquet files hosted directly on HuggingFace
+WIKITEXT_PARQUET = {
+    "train": [
+        "https://huggingface.co/datasets/Salesforce/wikitext/resolve/refs%2Fconvert%2Fparquet/wikitext-103-raw-v1/train/0000.parquet",
+        "https://huggingface.co/datasets/Salesforce/wikitext/resolve/refs%2Fconvert%2Fparquet/wikitext-103-raw-v1/train/0001.parquet",
+    ],
+    "validation": [
+        "https://huggingface.co/datasets/Salesforce/wikitext/resolve/refs%2Fconvert%2Fparquet/wikitext-103-raw-v1/validation/0000.parquet",
+    ],
+    "test": [
+        "https://huggingface.co/datasets/Salesforce/wikitext/resolve/refs%2Fconvert%2Fparquet/wikitext-103-raw-v1/test/0000.parquet",
+    ],
+}
+
 DOCS_PER_SHARD = 50_000
 
 
@@ -72,26 +85,71 @@ def shard_path(source: str, split: str, shard_idx: int) -> Path:
     return RAW_DIR / source / split / f"shard_{shard_idx:06d}.txt"
 
 
-# ── Per-dataset streaming download ──────────────────────────────────
+# ── Wikitext direct parquet download ─────────────────────────────────
+
+def _stream_wikitext(split: str):
+    """
+    Download wikitext-103 directly from HF parquet files.
+    Bypasses the broken S3 ZIP URL that datasets 2.2.x tries to use.
+    Train has 2 shards; validation and test have 1 each.
+    """
+    import requests
+    import pyarrow.parquet as pq
+
+    token   = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+    urls    = WIKITEXT_PARQUET[split]
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    for url in urls:
+        fname = url.split("/")[-1]
+        print(f"[download] fetching wikitext/{split}/{fname} from HF…")
+        r = requests.get(url, headers=headers, timeout=120)
+        r.raise_for_status()
+
+        table = pq.read_table(io.BytesIO(r.content))
+        for batch in table.to_batches():
+            for val in batch.column("text"):
+                text = val.as_py()
+                if text and text.strip():
+                    yield text.strip()
+
+
+# ── Per-dataset streaming download ───────────────────────────────────
 
 def _stream_dataset(hf_id: str, config: str | None, split: str,
                     text_col: str):
     """
-    Yield individual text strings using HuggingFace streaming.
-    No Arrow caching, no full download.
+    Yield individual text strings.
+    - wikitext: fetched directly via parquet (S3 URL is dead)
+    - others: HF datasets streaming with non-streaming fallback
     """
-    from datasets import load_dataset  # type: ignore
+    if hf_id == "wikitext":
+        yield from _stream_wikitext(split)
+        return
 
-    kwargs: dict = {"streaming": True, "trust_remote_code": False}
+    from datasets import load_dataset
+
+    kwargs: dict = {}
     if config:
         kwargs["name"] = config
 
-    ds = load_dataset(hf_id, split=split, **kwargs)
-    for example in ds:
-        text = example.get(text_col, "")
-        if text and text.strip():
-            yield text.strip()
+    try:
+        ds = load_dataset(hf_id, split=split, streaming=True, **kwargs)
+        for example in ds:
+            text = example.get(text_col, "")
+            if text and text.strip():
+                yield text.strip()
+    except Exception as e:
+        print(f"[download] streaming failed for {hf_id}/{split} ({e}), "
+              f"falling back to non-streaming…")
+        ds = load_dataset(hf_id, split=split, streaming=False, **kwargs)
+        for example in ds:
+            text = example.get(text_col, "")
+            if text and text.strip():
+                yield text.strip()
 
+
+# ── Per-source download ───────────────────────────────────────────────
 
 def download_source(
     cfg: dict,
@@ -111,17 +169,15 @@ def download_source(
         out_dir = RAW_DIR / source / split
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Buffer docs into shards
-        shard_idx  = 0
+        shard_idx         = 0
         buffer: list[str] = []
-        doc_count  = 0
+        doc_count         = 0
 
         def flush_shard():
             nonlocal shard_idx, buffer, doc_count
             sid  = shard_id(source, split, shard_idx)
             path = shard_path(source, split, shard_idx)
 
-            # Skip if already done
             if sid in manifest._entries:
                 from src.pipeline.manifest import ShardState
                 if manifest._entries[sid].state == ShardState.DONE:
@@ -129,6 +185,8 @@ def download_source(
                     buffer = []
                     return
 
+            # Register shard if not already in manifest
+            manifest.register_shards([sid])
             manifest.mark_processing(sid)
 
             with AtomicTextWriter(path) as w:
@@ -151,7 +209,7 @@ def download_source(
             buffer = []
 
         for text in _stream_dataset(cfg["hf_id"], cfg["config"],
-                                     split, cfg["text_col"]):
+                                    split, cfg["text_col"]):
             buffer.append(text)
             doc_count += 1
             if len(buffer) >= DOCS_PER_SHARD:
@@ -205,10 +263,6 @@ if __name__ == "__main__":
 # ── Compatibility shims (expected by sanity_check.py) ────────────────
 
 def discover(source: str, split: str) -> list[str]:
-    """
-    Return a deterministically sorted list of shard IDs for a given
-    source/split. Kept for backward compatibility with sanity_check.py.
-    """
     manifest = StageManifest(MANIFEST_DIR / "download.json")
     prefix   = f"{source}__{split}__"
     return sorted(
@@ -221,16 +275,10 @@ def download_shard_to_disk(
     manifest: StageManifest,
     stage_log=None,
 ) -> Path | None:
-    """
-    Download a single shard by its shard_id string.
-    Kept for backward compatibility with sanity_check.py.
-    Returns the output path on success, None if already done.
-    """
     from src.pipeline.manifest import ShardState
     if shard_id_str in manifest._entries and \
        manifest._entries[shard_id_str].state == ShardState.DONE:
         return Path(manifest._entries[shard_id_str].output_path)
-    # Resolve config for this shard
     source, split, _ = shard_id_str.split("__")
     cfg = next((c for c in DATASET_CONFIGS if c["name"] == source), None)
     if cfg is None:
@@ -241,12 +289,7 @@ def download_shard_to_disk(
 
 
 def parquet_to_txt(parquet_path: str, out_path: str, text_col: str = "text") -> int:
-    """
-    Convert a single parquet file to a plain-text file, one document per line.
-    Kept for backward compatibility with sanity_check.py.
-    Returns number of rows written.
-    """
-    import pyarrow.parquet as pq  # type: ignore
+    import pyarrow.parquet as pq
     table = pq.read_table(parquet_path, columns=[text_col])
     rows  = 0
     with open(out_path, "w", encoding="utf-8") as f:
