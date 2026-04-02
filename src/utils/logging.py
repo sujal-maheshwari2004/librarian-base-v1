@@ -13,6 +13,7 @@ MAGENTA= "\033[95m"
 RED    = "\033[91m"
 DIM    = "\033[2m"
 RESET  = "\033[0m"
+BOLD   = "\033[1m"
 
 _DASHBOARD_KEY = os.environ.get("DASHBOARD_KEY", "lib-450M-large")
 
@@ -64,6 +65,8 @@ class _BaseSender:
         }
 
     def _post(self, endpoint: str, payload: dict):
+        if not _DASHBOARD_KEY:
+            return
         try:
             r = requests.post(
                 f"{self.API_BASE}/{endpoint}",
@@ -71,33 +74,16 @@ class _BaseSender:
                 headers=self._headers,
                 timeout=5,
             )
-            if r.status_code not in (200, 201):
-                tqdm.write(f"{RED}[logger] POST {endpoint} → {r.status_code}: {r.text}{RESET}")
-        except Exception as e:
-            tqdm.write(f"{RED}[logger] POST {endpoint} failed: {e}{RESET}")
+            # Silently ignore all non-2xx responses (401, 404, etc.)
+            # Dashboard errors should never interrupt training
+        except Exception:
+            pass
 
 
 # ────────────────────────────────────────────────────────────
 # StageLogger — tracks pipeline stage progress + metrics
 # ────────────────────────────────────────────────────────────
 class StageLogger(_BaseSender):
-    """
-    Emit stage lifecycle events (start / progress / end / error)
-    with optional metrics at each stage.
-
-    Usage
-    -----
-        logger = StageLogger(run_id=run_id)
-
-        logger.start("download")
-        ...work...
-        logger.progress("download", {"files_downloaded": 3, "bytes": 1_200_000})
-        logger.end("download", {"total_files": 3, "total_bytes": 1_200_000})
-
-        logger.start("train")
-        ...
-        logger.error("train", "CUDA OOM at step 500")
-    """
 
     def __init__(self, run_id: int | None = None):
         super().__init__()
@@ -108,16 +94,12 @@ class StageLogger(_BaseSender):
         tqdm.write(f"{CYAN}PIPELINE{RESET}  run_id: {self.run_id}")
         tqdm.write("────────────────────────────────────────")
 
-    # ── public API ──────────────────────────────────────────
-
     def start(self, stage: str):
         self._stage_start[stage] = time.time()
         label = STAGE_LABELS.get(stage, stage)
         icon  = STAGE_ICONS.get(stage, "›")
 
-        tqdm.write(
-            f"\n{CYAN}{icon} START   {RESET}{label}"
-        )
+        tqdm.write(f"\n{CYAN}{icon} START   {RESET}{label}")
 
         self._post("stage_metrics", {
             "run_id":    self.run_id,
@@ -181,7 +163,7 @@ class StageLogger(_BaseSender):
 
 
 # ────────────────────────────────────────────────────────────
-# TrainingLogger — unchanged API, now also accepts run_id
+# TrainingLogger
 # ────────────────────────────────────────────────────────────
 class TrainingLogger(_BaseSender):
 
@@ -200,11 +182,10 @@ class TrainingLogger(_BaseSender):
         tqdm.write(f"run_id:  {self.run_id}")
         tqdm.write(f"seq_len: {seq_len}  batch: {batch_size}")
         tqdm.write(
-            f"key:     {'set' if _DASHBOARD_KEY else 'NOT SET — metrics will still send'}"
+            f"key:     {'set' if _DASHBOARD_KEY else 'NOT SET'}"
         )
         tqdm.write("────────────────────────────────────────")
 
-    # ── throughput ──────────────────────────────────────────
     def throughput(self):
         now     = time.time()
         elapsed = max(now - self.last_time, 1e-9)
@@ -213,31 +194,28 @@ class TrainingLogger(_BaseSender):
         self.tokens_seen += tokens
         return int(tokens / elapsed)
 
-    # ── gpu mem ─────────────────────────────────────────────
     def gpu_mem(self):
         if torch.cuda.is_available():
             return torch.cuda.memory_allocated() / 1e9
         return 0
 
-    # ── send ────────────────────────────────────────────────
     def _send(self, payload: dict):
         self._post("train_metrics", payload)
 
-    # ── train ───────────────────────────────────────────────
     def train(self, step, loss, lr, grad):
         tok_s = self.throughput()
         gpu   = self.gpu_mem()
 
         self._send({
-            "run_id":          self.run_id,
-            "type":            "train",
-            "step":            step,
-            "loss":            float(loss),
-            "lr":              float(lr),
-            "grad_norm":       float(grad),
-            "tokens_per_sec":  tok_s,
-            "gpu_mem_gb":      gpu,
-            "timestamp":       time.time(),
+            "run_id":         self.run_id,
+            "type":           "train",
+            "step":           step,
+            "loss":           float(loss),
+            "lr":             float(lr),
+            "grad_norm":      float(grad),
+            "tokens_per_sec": tok_s,
+            "gpu_mem_gb":     gpu,
+            "timestamp":      time.time(),
         })
 
         tqdm.write(
@@ -250,14 +228,13 @@ class TrainingLogger(_BaseSender):
             f"gpu {gpu:4.2f}GB"
         )
 
-    # ── eval ────────────────────────────────────────────────
     def eval(self, step, val_loss):
         self._send({
-            "run_id":    self.run_id,
-            "type":      "eval",
-            "step":      step,
-            "val_loss":  float(val_loss),
-            "timestamp": time.time(),
+            "run_id":   self.run_id,
+            "type":     "eval",
+            "step":     step,
+            "val_loss": float(val_loss),
+            "timestamp":time.time(),
         })
 
         tqdm.write(
@@ -266,14 +243,13 @@ class TrainingLogger(_BaseSender):
             f"val_loss {val_loss:6.4f}"
         )
 
-    # ── checkpoint ──────────────────────────────────────────
     def checkpoint(self, step, val_loss):
         self._send({
-            "run_id":    self.run_id,
-            "type":      "checkpoint",
-            "step":      step,
-            "val_loss":  float(val_loss),
-            "timestamp": time.time(),
+            "run_id":   self.run_id,
+            "type":     "checkpoint",
+            "step":     step,
+            "val_loss": float(val_loss),
+            "timestamp":time.time(),
         })
 
         tqdm.write(
