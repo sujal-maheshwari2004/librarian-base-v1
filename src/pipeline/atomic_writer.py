@@ -80,3 +80,45 @@ class AtomicTextWriter:
         if exc_type is None:
             os.replace(self._tmp_path, self.target)
         return False
+
+
+def recover_stranded_tmps(
+    root: str | Path,
+    src_ext: str = ".tmp",
+    dst_ext: str = ".txt",
+    verbose: bool = True,
+) -> int:
+    """
+    Rename all files matching src_ext under root to dst_ext.
+
+    Called at the start of any stage that reads the output of a previous
+    stage that uses AtomicTextWriter, to recover from a mid-write crash
+    where the atomic rename never completed.
+
+    If a completed destination file already exists alongside a .tmp,
+    the .tmp is removed (stale partial write) rather than overwriting
+    the good file.
+
+    Returns the number of files renamed.
+    """
+    root = Path(root)
+    if not root.exists():
+        return 0
+
+    renamed = 0
+    for tmp in sorted(root.rglob(f"*{src_ext}")):
+        dst = tmp.with_suffix(dst_ext)
+        if dst.exists():
+            # A completed file already exists — the .tmp is a leftover
+            # from a previous partial attempt; remove it.
+            tmp.unlink()
+            if verbose:
+                print(f"[recover_tmps] Removed stale {tmp.name} (dst exists)")
+        else:
+            os.replace(tmp, dst)
+            renamed += 1
+
+    if renamed and verbose:
+        print(f"[recover_tmps] Renamed {renamed} .tmp → {dst_ext} under {root}")
+
+    return renamed
