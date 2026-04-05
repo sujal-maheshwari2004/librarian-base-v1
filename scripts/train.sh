@@ -60,21 +60,20 @@ run_step () {
 }
 
 # ── Run all preprocessing stages via the orchestrator ────────────────
-# This handles download → clean → tokenize → pack with manifest-based
-# resume, shard-level progress, and automatic artifact cleanup.
+# Handles: download → clean → train_tokenizer → tokenize → pack
+# with manifest-based resume, shard-level progress, and automatic
+# artifact cleanup. train_tokenizer runs inside the pipeline
+# immediately after clean, while data/cleaned still exists.
 run_step "Preprocessing pipeline" "python -m src.pipeline.pipeline"
 
-# ── Verify packed dataset exists before proceeding ───────────────────
+# ── Verify packed dataset and tokenizer exist before training ─────────
 [ -f data/tokenized/train_packed.bin ] || {
     echo "ERROR: train_packed.bin missing after pipeline"
     exit 1
 }
 
-# ── Train tokenizer (reads from cleaned shards, no merged file needed) ─
-run_step "Train tokenizer" "python -m tokenizer.train_tokenizer"
-
 [ -f tokenizer/tokenizer.json ] || {
-    echo "ERROR: tokenizer/tokenizer.json missing"
+    echo "ERROR: tokenizer/tokenizer.json missing after pipeline"
     exit 1
 }
 
