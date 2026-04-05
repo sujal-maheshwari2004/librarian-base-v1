@@ -8,6 +8,8 @@ Changes from original:
   - Wikitext fetched directly via HF parquet (bypasses broken S3 URL)
   - bookcorpus / openwebtext use HF datasets streaming with fallback
   - After all shards verified, downstream stages can safely delete this dir
+  - Each source has a max_shards cap (None = unlimited) to allow a fast
+    tokenizer-only run before committing to the full dataset download
 """
 
 from __future__ import annotations
@@ -31,30 +33,41 @@ RAW_DIR      = Path("data/raw/shards")
 MANIFEST_DIR = Path("data/manifests")
 _RUN_ID      = int(os.environ.get("RUN_ID", 0)) or None
 
+DOCS_PER_SHARD = 50_000
+
+# max_shards caps how many shards to download per source/split.
+# None = no limit (download everything) — use this for full training runs.
+# Set to a small number (e.g. bookcorpus=50, openwebtext=20) for a fast
+# tokenizer-only run. The manifest is additive, so a subsequent full run
+# with max_shards=None will resume from where the capped run left off
+# without re-downloading already-completed shards.
 DATASET_CONFIGS = [
     {
-        "name":     "wikitext",
-        "hf_id":    "wikitext",
-        "config":   "wikitext-103-raw-v1",
-        "splits":   ["train", "validation", "test"],
-        "text_col": "text",
-        "weight":   0.30,
+        "name":       "wikitext",
+        "hf_id":      "wikitext",
+        "config":     "wikitext-103-raw-v1",
+        "splits":     ["train", "validation", "test"],
+        "text_col":   "text",
+        "weight":     0.30,
+        "max_shards": None,   # wikitext is small (~4 shards total), always full
     },
     {
-        "name":     "bookcorpus",
-        "hf_id":    "bookcorpus",
-        "config":   None,
-        "splits":   ["train"],
-        "text_col": "text",
-        "weight":   0.50,
+        "name":       "bookcorpus",
+        "hf_id":      "bookcorpus",
+        "config":     None,
+        "splits":     ["train"],
+        "text_col":   "text",
+        "weight":     0.50,
+        "max_shards": None,   # set to e.g. 50 for a tokenizer-only run
     },
     {
-        "name":     "openwebtext",
-        "hf_id":    "openwebtext",
-        "config":   None,
-        "splits":   ["train"],
-        "text_col": "text",
-        "weight":   0.20,
+        "name":       "openwebtext",
+        "hf_id":      "openwebtext",
+        "config":     None,
+        "splits":     ["train"],
+        "text_col":   "text",
+        "weight":     0.20,
+        "max_shards": None,   # set to e.g. 20 for a tokenizer-only run
     },
 ]
 
@@ -71,8 +84,6 @@ WIKITEXT_PARQUET = {
         "https://huggingface.co/datasets/Salesforce/wikitext/resolve/refs%2Fconvert%2Fparquet/wikitext-103-raw-v1/test/0000.parquet",
     ],
 }
-
-DOCS_PER_SHARD = 50_000
 
 
 # ── Shard ID helpers ─────────────────────────────────────────────────
@@ -114,6 +125,35 @@ def _stream_wikitext(split: str):
                     yield text.strip()
 
 
+# ── Fineweb-edu direct parquet download ──────────────────────────────
+
+def _stream_fineweb_edu(split: str):
+    import requests
+    import pyarrow.parquet as pq
+
+    token   = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    api_url = ("https://datasets-server.huggingface.co/parquet"
+               "?dataset=HuggingFaceFW/fineweb-edu&config=sample-10BT&split=train")
+    r = requests.get(api_url, headers=headers, timeout=30)
+    r.raise_for_status()
+    files = [f["url"] for f in r.json()["parquet_files"]]
+
+    print(f"[download] fineweb-edu: fetching {len(files)} of available parquet shards")
+
+    for i, url in enumerate(files):
+        print(f"[download] fineweb-edu shard {i+1}/{len(files)}…")
+        r = requests.get(url, headers=headers, timeout=300)
+        r.raise_for_status()
+        table = pq.read_table(io.BytesIO(r.content), columns=["text"])
+        for batch in table.to_batches():
+            for val in batch.column("text"):
+                text = val.as_py()
+                if text and text.strip():
+                    yield text.strip()
+
+
 # ── Per-dataset streaming download ───────────────────────────────────
 
 def _stream_dataset(hf_id: str, config: str | None, split: str,
@@ -121,10 +161,15 @@ def _stream_dataset(hf_id: str, config: str | None, split: str,
     """
     Yield individual text strings.
     - wikitext: fetched directly via parquet (S3 URL is dead)
+    - fineweb-edu: fetched directly via HF datasets-server API
     - others: HF datasets streaming with non-streaming fallback
     """
     if hf_id == "wikitext":
         yield from _stream_wikitext(split)
+        return
+
+    if hf_id == "HuggingFaceFW/fineweb-edu":
+        yield from _stream_fineweb_edu(split)
         return
 
     from datasets import load_dataset
@@ -159,22 +204,29 @@ def download_source(
     """
     Download all splits for one data source into sharded .txt files.
     Idempotent: skips shards already in DONE state.
+    Stops early if max_shards is set and reached.
     Returns total documents written.
     """
-    source = cfg["name"]
-    total  = 0
+    source     = cfg["name"]
+    max_shards = cfg.get("max_shards")   # None = unlimited
+    total      = 0
 
     for split in cfg["splits"]:
         print(f"\n[download] {source}/{split} — streaming…")
+        if max_shards is not None:
+            print(f"[download] {source}/{split} — capped at {max_shards} shards "
+                  f"({max_shards * DOCS_PER_SHARD:,} docs max)")
+
         out_dir = RAW_DIR / source / split
         out_dir.mkdir(parents=True, exist_ok=True)
 
         shard_idx         = 0
         buffer: list[str] = []
         doc_count         = 0
+        stop_early        = False
 
         def flush_shard():
-            nonlocal shard_idx, buffer, doc_count
+            nonlocal shard_idx, buffer, doc_count, stop_early
             sid  = shard_id(source, split, shard_idx)
             path = shard_path(source, split, shard_idx)
 
@@ -208,18 +260,28 @@ def download_source(
             shard_idx += 1
             buffer = []
 
+            # Check cap AFTER incrementing shard_idx
+            if max_shards is not None and shard_idx >= max_shards:
+                stop_early = True
+
         for text in _stream_dataset(cfg["hf_id"], cfg["config"],
                                     split, cfg["text_col"]):
+            if stop_early:
+                break
             buffer.append(text)
             doc_count += 1
             if len(buffer) >= DOCS_PER_SHARD:
                 flush_shard()
+                if stop_early:
+                    break
 
-        if buffer:
+        # Flush remaining partial shard (unless we hit the cap exactly)
+        if buffer and not stop_early:
             flush_shard()
 
         total += doc_count
-        print(f"[download] {source}/{split}: {doc_count:,} docs in {shard_idx} shards")
+        print(f"[download] {source}/{split}: {doc_count:,} docs in {shard_idx} shards"
+              + (" (capped)" if stop_early else ""))
 
     return total
 
