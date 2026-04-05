@@ -1,146 +1,173 @@
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+"""
+pipeline.py — Orchestrates the full preprocessing pipeline.
 
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import ByteLevel
-from tokenizers.normalizers import NFKC
-from tokenizers.processors import TemplateProcessing
-from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+Stages run in order:
+  download → clean → train_tokenizer → tokenize → pack
 
-import json
+Each stage:
+  1. Checks its input manifest is complete before starting
+  2. Writes progress to its own manifest (shard-level)
+  3. Validates outputs before deleting previous stage
+  4. Is safe to restart mid-stage
+
+Usage
+-----
+    # Full pipeline
+    python -m src.pipeline.pipeline
+
+    # Start from a specific stage (useful after partial failure)
+    python -m src.pipeline.pipeline --start-from tokenize
+
+    # Dry-run cleanup check
+    python -m src.pipeline.pipeline --dry-run-cleanup
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
-import tempfile
+import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from src.pipeline.manifest import StageManifest
 from src.utils.logging import StageLogger
-from src.data.clean import iter_documents_from_shards, CLEANED_DIR
 
-TOKENIZER_DIR  = Path("tokenizer")
-VOCAB_SIZE     = 32000
-MIN_FREQUENCY  = 2
-SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
+MANIFEST_DIR = Path("data/manifests")
+_RUN_ID      = int(os.environ.get("RUN_ID", 0)) or None
 
-_RUN_ID = int(os.environ.get("RUN_ID", 0)) or None
+STAGE_ORDER = ["download", "clean", "train_tokenizer", "tokenize", "pack"]
 
 
-def _write_temp_corpus(tmp_path: Path, stage_logger=None) -> int:
-    """
-    Stream all cleaned shards into a single temporary text file that
-    the HuggingFace BpeTrainer can read (it requires a file path, not
-    an iterator).  The temp file is deleted after training completes.
-
-    Returns the number of lines written.
-    """
-    if not CLEANED_DIR.exists():
-        raise FileNotFoundError(
-            f"Cleaned shards directory not found: {CLEANED_DIR}\n"
-            "Run the clean stage before training the tokenizer."
-        )
-
-    shard_files = sorted(CLEANED_DIR.rglob("*.txt"))
-    if not shard_files:
-        raise FileNotFoundError(
-            f"No cleaned shard files found under {CLEANED_DIR}"
-        )
-
-    print(f"[train_tokenizer] Streaming {len(shard_files)} shard(s) into temp corpus…")
-
-    lines_written = 0
-    with tmp_path.open("w", encoding="utf-8") as out:
-        for doc in iter_documents_from_shards(CLEANED_DIR):
-            out.write(doc + "\n")
-            lines_written += 1
-            if lines_written % 500_000 == 0:
-                print(f"[train_tokenizer]   {lines_written:,} lines streamed…")
-                if stage_logger:
-                    stage_logger.progress("train_tokenizer", {
-                        "lines_streamed": lines_written,
-                    })
-
-    print(f"[train_tokenizer] Corpus ready: {lines_written:,} lines")
-    return lines_written
+def stage_is_complete(stage: str) -> bool:
+    manifest_path = MANIFEST_DIR / f"{stage}.json"
+    if not manifest_path.exists():
+        return False
+    return StageManifest(manifest_path).is_complete()
 
 
-def train_tokenizer(stage_logger=None):
-    TOKENIZER_DIR.mkdir(parents=True, exist_ok=True)
+def run_pipeline(
+    start_from: str = "download",
+    dry_run_cleanup: bool = False,
+):
+    stage_log = StageLogger(run_id=_RUN_ID)
 
-    print("\n=== Initializing Tokenizer ===")
+    start_idx = STAGE_ORDER.index(start_from)
+    stages    = STAGE_ORDER[start_idx:]
 
-    if stage_logger:
-        stage_logger.progress("train_tokenizer", {
-            "vocab_size":    VOCAB_SIZE,
-            "min_frequency": MIN_FREQUENCY,
-            "shards_dir":    str(CLEANED_DIR),
-        })
+    print(f"\n{'='*60}")
+    print(f"  Librarian Preprocessing Pipeline")
+    print(f"{'='*60}")
+    for stage in STAGE_ORDER:
+        done = stage_is_complete(stage)
+        print(f"  {'✓' if done else '○'} {stage}")
+    print(f"{'='*60}")
+    print(f"  Starting from: {start_from}")
 
-    # Stream cleaned shards into a temp file (BpeTrainer needs a path)
-    with tempfile.TemporaryDirectory(prefix="librarian_tok_") as tmp_dir:
-        corpus_path = Path(tmp_dir) / "corpus.txt"
-        lines = _write_temp_corpus(corpus_path, stage_logger)
+    t_start = time.time()
 
-        tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-        tokenizer.normalizer    = NFKC()
-        tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
+    for stage in stages:
+        if stage_is_complete(stage):
+            print(f"\n[pipeline] Stage '{stage}' already complete — skipping")
+            continue
 
-        trainer = BpeTrainer(
-            vocab_size=VOCAB_SIZE,
-            min_frequency=MIN_FREQUENCY,
-            special_tokens=SPECIAL_TOKENS,
-        )
-
-        print("Training tokenizer…")
+        print(f"\n[pipeline] Starting stage: {stage}")
+        stage_log.start(stage)
         t0 = time.time()
-        tokenizer.train([str(corpus_path)], trainer)
-        train_elapsed = time.time() - t0
-        # corpus_path is deleted automatically when the with-block exits
 
-    print("Adding BOS/EOS post-processing…")
-    tokenizer.post_processor = TemplateProcessing(
-        single="<bos> $A <eos>",
-        special_tokens=[
-            ("<bos>", tokenizer.token_to_id("<bos>")),
-            ("<eos>", tokenizer.token_to_id("<eos>")),
-        ],
+        try:
+            if stage == "download":
+                from src.data.download import download_datasets
+                summary = download_datasets(stage_log=stage_log)
+
+            elif stage == "clean":
+                from src.data.clean import run_clean
+                summary = run_clean(stage_log=stage_log)
+
+            elif stage == "train_tokenizer":
+                from tokenizer.train_tokenizer import train_tokenizer
+                summary = train_tokenizer(stage_logger=stage_log)
+                # Write a sentinel manifest so stage_is_complete() works
+                # on resume. train_tokenizer is a single-artifact stage
+                # (one output file) so we use a single shard entry.
+                m = StageManifest(MANIFEST_DIR / "train_tokenizer.json")
+                m.register_shards(["tokenizer"], meta={"stage": "train_tokenizer"})
+                m.mark_processing("tokenizer")
+                m.mark_verified("tokenizer", "tokenizer/tokenizer.json", "", 0)
+                m.mark_done("tokenizer")
+
+            elif stage == "tokenize":
+                from src.data.tokenizer import run_tokenize
+                summary = run_tokenize(stage_log=stage_log)
+
+            elif stage == "pack":
+                from src.data.pack import run_pack
+                summary = run_pack(stage_log=stage_log)
+
+            else:
+                raise ValueError(f"Unknown stage: {stage}")
+
+        except Exception as e:
+            stage_log.error(stage, str(e))
+            print(f"\n[pipeline] FATAL: stage '{stage}' failed: {e}")
+            print(f"[pipeline] Fix the issue and re-run with --start-from {stage}")
+            raise
+
+        elapsed = time.time() - t0
+        stage_log.end(stage, {**summary, "elapsed_s": round(elapsed, 1)})
+        print(f"[pipeline] Stage '{stage}' complete in {elapsed:.1f}s")
+
+    total = time.time() - t_start
+    print(f"\n{'='*60}")
+    print(f"  Pipeline complete in {total:.1f}s")
+    print(f"{'='*60}")
+
+    # Print storage summary
+    _print_storage_summary()
+
+
+def _print_storage_summary():
+    dirs = {
+        "data/raw":                  Path("data/raw"),
+        "data/cleaned":              Path("data/cleaned"),
+        "data/tokenized/shards":     Path("data/tokenized/shards"),
+        "data/tokenized (packed)":   Path("data/tokenized"),
+        "tokenizer":                 Path("tokenizer"),
+        "checkpoints":               Path("checkpoints"),
+        "logs":                      Path("logs"),
+        "data/manifests":            Path("data/manifests"),
+    }
+
+    print("\n  Storage summary:")
+    for label, path in dirs.items():
+        if not path.exists():
+            continue
+        size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        print(f"    {label:35s}: {size / 1e9:.2f} GB")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Librarian preprocessing pipeline")
+    parser.add_argument(
+        "--start-from",
+        choices=STAGE_ORDER,
+        default="download",
+        help="Start (or resume) from this stage",
     )
-    tokenizer.decoder = ByteLevelDecoder()
+    parser.add_argument(
+        "--dry-run-cleanup",
+        action="store_true",
+        help="Show what cleanup would delete without deleting",
+    )
+    args = parser.parse_args()
 
-    print("Saving tokenizer files…")
-    tokenizer.save(str(TOKENIZER_DIR / "tokenizer.json"))
-
-    config = {
-        "vocab_size":     tokenizer.get_vocab_size(),
-        "model":          "BPE",
-        "pre_tokenizer":  "ByteLevel",
-        "normalizer":     "NFKC",
-        "min_frequency":  MIN_FREQUENCY,
-        "special_tokens": SPECIAL_TOKENS,
-    }
-    with open(TOKENIZER_DIR / "tokenizer_config.json", "w") as f:
-        json.dump(config, f, indent=4)
-
-    print("\nTokenizer training complete.")
-    print(f"Final vocab size : {tokenizer.get_vocab_size()}")
-    print(f"Lines trained on : {lines:,}")
-    print(f"Elapsed          : {train_elapsed:.1f}s")
-
-    return {
-        "final_vocab_size": tokenizer.get_vocab_size(),
-        "lines_trained_on": lines,
-        "train_elapsed_s":  round(train_elapsed, 2),
-        "special_tokens":   len(SPECIAL_TOKENS),
-    }
+    run_pipeline(
+        start_from      = args.start_from,
+        dry_run_cleanup = args.dry_run_cleanup,
+    )
 
 
 if __name__ == "__main__":
-    log = StageLogger(run_id=_RUN_ID)
-    log.start("train_tokenizer")
-    try:
-        summary = train_tokenizer(stage_logger=log)
-        log.end("train_tokenizer", summary)
-    except Exception as e:
-        log.error("train_tokenizer", str(e))
-        raise
+    main()
