@@ -2,7 +2,7 @@
 pipeline.py — Orchestrates the full preprocessing pipeline.
 
 Stages run in order:
-  download → clean → tokenize → pack
+  download → clean → train_tokenizer → tokenize → pack
 
 Each stage:
   1. Checks its input manifest is complete before starting
@@ -38,7 +38,7 @@ from src.utils.logging import StageLogger
 MANIFEST_DIR = Path("data/manifests")
 _RUN_ID      = int(os.environ.get("RUN_ID", 0)) or None
 
-STAGE_ORDER = ["download", "clean", "tokenize", "pack"]
+STAGE_ORDER = ["download", "clean", "train_tokenizer", "tokenize", "pack"]
 
 
 def stage_is_complete(stage: str) -> bool:
@@ -86,6 +86,18 @@ def run_pipeline(
                 from src.data.clean import run_clean
                 summary = run_clean(stage_log=stage_log)
 
+            elif stage == "train_tokenizer":
+                from tokenizer.train_tokenizer import train_tokenizer
+                summary = train_tokenizer(stage_logger=stage_log)
+                # Write a sentinel manifest so stage_is_complete() works
+                # on resume. train_tokenizer is a single-artifact stage
+                # (one output file) so we use a single shard entry.
+                m = StageManifest(MANIFEST_DIR / "train_tokenizer.json")
+                m.register_shards(["tokenizer"], meta={"stage": "train_tokenizer"})
+                m.mark_processing("tokenizer")
+                m.mark_verified("tokenizer", "tokenizer/tokenizer.json", "", 0)
+                m.mark_done("tokenizer")
+
             elif stage == "tokenize":
                 from src.data.tokenizer import run_tokenize
                 summary = run_tokenize(stage_log=stage_log)
@@ -118,14 +130,14 @@ def run_pipeline(
 
 def _print_storage_summary():
     dirs = {
-        "data/raw":             Path("data/raw"),
-        "data/cleaned":         Path("data/cleaned"),
-        "data/tokenized/shards":Path("data/tokenized/shards"),
-        "data/tokenized (packed)": Path("data/tokenized"),
-        "tokenizer":            Path("tokenizer"),
-        "checkpoints":          Path("checkpoints"),
-        "logs":                 Path("logs"),
-        "data/manifests":       Path("data/manifests"),
+        "data/raw":                  Path("data/raw"),
+        "data/cleaned":              Path("data/cleaned"),
+        "data/tokenized/shards":     Path("data/tokenized/shards"),
+        "data/tokenized (packed)":   Path("data/tokenized"),
+        "tokenizer":                 Path("tokenizer"),
+        "checkpoints":               Path("checkpoints"),
+        "logs":                      Path("logs"),
+        "data/manifests":            Path("data/manifests"),
     }
 
     print("\n  Storage summary:")
